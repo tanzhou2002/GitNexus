@@ -1,471 +1,255 @@
+/**
+ * Route / fetch edge emission + exported-type-map helpers.
+ *
+ * The legacy call-resolution DAG that previously lived here (per-file type
+ * inference → receiver inference → dispatch selection → MRO walk over the
+ * legacy heritage map) was deleted in RING4-1 (#942): all languages now resolve
+ * calls through the scope-resolution registry pipeline. What remains are the
+ * language-agnostic edge emitters that are NOT part of call resolution:
+ *
+ *   - `processRoutesFromExtracted` — CALLS edges from framework routes
+ *     (e.g. Laravel) to their controller methods.
+ *   - `processNextjsFetchRoutes` / `extractConsumerAccessedKeys` — FETCHES edges
+ *     from `fetch()` calls to Next.js Route nodes.
+ *   - `buildExportedTypeMapFromGraph` — exported symbol → return/declared type
+ *     map, consumed by the cross-file enrichment pass.
+ */
+
 import { KnowledgeGraph } from '../graph/types.js';
-import { ASTCache } from './ast-cache.js';
-import { SymbolTable } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
-import Parser from 'tree-sitter';
-import { loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
-import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
+import type { SemanticModel, SymbolTableReader } from './model/index.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename, yieldToEventLoop } from './utils.js';
-import type { ExtractedCall, ExtractedRoute } from './workers/parse-worker.js';
+import type { ParsedImport, SymbolDefinition } from 'gitnexus-shared';
+import { yieldToEventLoop } from './utils/event-loop.js';
+import type { ExtractedRoute, ExtractedFetchCall } from './workers/parse-worker.js';
+import type { ExtractedDecoratorRoute } from './workers/parse-worker.js';
+import type { LanguageProvider } from './language-provider.js';
+import { normalizeFetchURL, routeMatches } from './route-extractors/nextjs.js';
+import {
+  normalizeExtractedRoutePath,
+  normalizeRouteMethod,
+  routeNodeKey,
+} from './route-extractors/route-path.js';
+import { extractReturnTypeName } from './type-extractors/shared.js';
+import { DATA_ROUTE_TABLE_SOURCE } from './route-extractors/data-route-table.js';
+import { toZeroBasedLine } from './utils/line-base.js';
 
-/**
- * Node types that represent function/method definitions across languages.
- * Used to find the enclosing function for a call site.
- */
-const FUNCTION_NODE_TYPES = new Set([
-  // TypeScript/JavaScript
-  'function_declaration',
-  'arrow_function',
-  'function_expression',
-  'method_definition',
-  'generator_function_declaration',
-  // Python
-  'function_definition',
-  // Common async variants
-  'async_function_declaration',
-  'async_arrow_function',
-  // Java
-  'method_declaration',
-  'constructor_declaration',
-  // C/C++
-  // 'function_definition' already included above
-  // Go
-  // 'method_declaration' already included from Java
-  // C#
-  'local_function_statement',
-  // Rust
-  'function_item',
-  'impl_item', // Methods inside impl blocks
-  // Kotlin (function_declaration already included above via JS/TS)
-  'anonymous_function',
-  'lambda_literal',
-  // PHP — no additional node types needed
-  // Swift
-  'init_declaration',
-  'deinit_declaration',
-]);
+const MAX_EXPORTS_PER_FILE = 500;
+const MAX_TYPE_NAME_LENGTH = 256;
 
-/**
- * Walk up the AST from a node to find the enclosing function/method.
- * Returns null if the call is at module/file level (top-level code).
- */
-const findEnclosingFunction = (
-  node: any,
-  filePath: string,
-  symbolTable: SymbolTable
-): string | null => {
-  let current = node.parent;
-  
-  while (current) {
-    if (FUNCTION_NODE_TYPES.has(current.type)) {
-      // Found enclosing function - try to get its name
-      let funcName: string | null = null;
-      let label = 'Function';
-      
-      // Different node types have different name locations
-      // Swift init/deinit — handle before generic cases (more specific)
-      if (current.type === 'init_declaration' || current.type === 'deinit_declaration') {
-        const funcName = current.type === 'init_declaration' ? 'init' : 'deinit';
-        return generateId('Constructor', `${filePath}:${funcName}`);
-      }
+/** Per-file resolved type bindings for exported symbols.
+ *  Consumed by the cross-file re-resolution / enrichment pass. */
+export type ExportedTypeMap = Map<string, Map<string, string>>;
 
-      if (current.type === 'function_declaration' ||
-          current.type === 'function_definition' ||
-          current.type === 'async_function_declaration' ||
-          current.type === 'generator_function_declaration' ||
-          current.type === 'function_item') { // Rust function
-        // Named function: function foo() {}
-        const nameNode = current.childForFieldName?.('name') || 
-                         current.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier');
-        funcName = nameNode?.text;
-      } else if (current.type === 'impl_item') {
-        // Rust method inside impl block: wrapper around function_item or const_item
-        // We need to look inside for the function_item
-        const funcItem = current.children?.find((c: any) => c.type === 'function_item');
-        if (funcItem) {
-           const nameNode = funcItem.childForFieldName?.('name') || 
-                            funcItem.children?.find((c: any) => c.type === 'identifier');
-           funcName = nameNode?.text;
-           label = 'Method';
-        }
-      } else if (current.type === 'method_definition') {
-        // Method: foo() {} inside class (JS/TS)
-        const nameNode = current.childForFieldName?.('name') ||
-                         current.children?.find((c: any) => c.type === 'property_identifier');
-        funcName = nameNode?.text;
-        label = 'Method';
-      } else if (current.type === 'method_declaration') {
-        // Java method: public void foo() {}
-        const nameNode = current.childForFieldName?.('name') ||
-                         current.children?.find((c: any) => c.type === 'identifier');
-        funcName = nameNode?.text;
-        label = 'Method';
-      } else if (current.type === 'constructor_declaration') {
-        // Java constructor: public ClassName() {}
-        const nameNode = current.childForFieldName?.('name') ||
-                         current.children?.find((c: any) => c.type === 'identifier');
-        funcName = nameNode?.text;
-        label = 'Method'; // Treat constructors as methods for process detection
-      } else if (current.type === 'arrow_function' || current.type === 'function_expression') {
-        // Arrow/expression: const foo = () => {} - check parent variable declarator
-        const parent = current.parent;
-        if (parent?.type === 'variable_declarator') {
-          const nameNode = parent.childForFieldName?.('name') ||
-                           parent.children?.find((c: any) => c.type === 'identifier');
-          funcName = nameNode?.text;
-        }
-      }
-      
-      if (funcName) {
-        // Look up the function in symbol table to get its node ID
-        // Try exact match first
-        const nodeId = symbolTable.lookupExact(filePath, funcName);
-        if (nodeId) return nodeId;
-        
-        // Try construct ID manually if lookup fails (common for non-exported internal functions)
-        // Format should match what parsing-processor generates: "Function:path/to/file:funcName"
-        // Check if we already have a node with this ID in the symbol table to be safe
-        const generatedId = generateId(label, `${filePath}:${funcName}`);
-        
-        // Ideally we should verify this ID exists, but strictly speaking if we are inside it,
-        // it SHOULD exist. Returning it is better than falling back to File.
-        return generatedId;
-      }
-      
-      // Couldn't determine function name - try parent (might be nested)
-    }
-    current = current.parent;
-  }
-  
-  return null; // Top-level call (not inside any function)
-};
+interface RouteResolutionFile {
+  readonly filePath: string;
+  readonly parsedImports: readonly ParsedImport[];
+  readonly localDefs: readonly SymbolDefinition[];
+}
 
-export const processCalls = async (
-  graph: KnowledgeGraph,
-  files: { path: string; content: string }[],
-  astCache: ASTCache,
-  symbolTable: SymbolTable,
-  importMap: ImportMap,
-  onProgress?: (current: number, total: number) => void
-) => {
-  const parser = await loadParser();
+interface RouteHandlerResolutionContext {
+  readonly files: readonly RouteResolutionFile[];
+  readonly resolveImportTarget: (parsedImport: ParsedImport, fromFile: string) => string | null;
+  /** Every file an import resolves to (an import may name a whole directory of files). */
+  readonly resolveImportTargets?: (
+    parsedImport: ParsedImport,
+    fromFile: string,
+  ) => readonly string[];
+  /** The route file's `LanguageProvider.resolveRouteHandler`, when it defines one. */
+  readonly providerRouteHandler?: (filePath: string) => LanguageProvider['resolveRouteHandler'];
+  readonly isExportedSymbol: (nodeId: string) => boolean;
+  /** 0-based graph-node startLine for same-name tRPC handler disambiguation. */
+  readonly nodeStartLine?: (nodeId: string) => number | undefined;
+}
 
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    onProgress?.(i + 1, files.length);
-    if (i % 20 === 0) await yieldToEventLoop();
-
-    // 1. Check language support first
-    const language = getLanguageFromFilename(file.path);
-    if (!language) continue;
-
-    const queryStr = LANGUAGE_QUERIES[language];
-    if (!queryStr) continue;
-
-    // 2. ALWAYS load the language before querying (parser is stateful)
-    await loadLanguage(language, file.path);
-
-    // 3. Get AST (Try Cache First)
-    let tree = astCache.get(file.path);
-    let wasReparsed = false;
-
-    if (!tree) {
-      // Cache Miss: Re-parse
-      // Use larger bufferSize for files > 32KB
-      try {
-        tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
-      } catch (parseError) {
-        // Skip files that can't be parsed
-        continue;
-      }
-      wasReparsed = true;
-      // Cache re-parsed tree so heritage phase gets hits
-      astCache.set(file.path, tree);
-    }
-
-    let query;
-    let matches;
-    try {
-      const language = parser.getLanguage();
-      query = new Parser.Query(language, queryStr);
-      matches = query.matches(tree.rootNode);
-    } catch (queryError) {
-      console.warn(`Query error for ${file.path}:`, queryError);
-      continue;
-    }
-
-    // 3. Process each call match
-    matches.forEach(match => {
-      const captureMap: Record<string, any> = {};
-      match.captures.forEach(c => captureMap[c.name] = c.node);
-
-      // Only process @call captures
-      if (!captureMap['call']) return;
-
-      const nameNode = captureMap['call.name'];
-      if (!nameNode) return;
-
-      const calledName = nameNode.text;
-
-      // Skip common built-ins and noise
-      if (isBuiltInOrNoise(calledName)) return;
-
-      // 4. Resolve the target using priority strategy (returns confidence)
-      const resolved = resolveCallTarget(
-        calledName,
-        file.path,
-        symbolTable,
-        importMap
-      );
-
-      if (!resolved) return;
-
-      // 5. Find the enclosing function (caller)
-      const callNode = captureMap['call'];
-      const enclosingFuncId = findEnclosingFunction(callNode, file.path, symbolTable);
-      
-      // Use enclosing function as source, fallback to file for top-level calls
-      const sourceId = enclosingFuncId || generateId('File', file.path);
-      
-      const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
-
-      graph.addRelationship({
-        id: relId,
-        sourceId,
-        targetId: resolved.nodeId,
-        type: 'CALLS',
-        confidence: resolved.confidence,
-        reason: resolved.reason,
-      });
-    });
-
-    // Tree is now owned by the LRU cache — no manual delete needed
-  }
-};
-
-/**
- * Resolution result with confidence scoring
- */
-interface ResolveResult {
-  nodeId: string;
-  confidence: number;  // 0-1: how sure are we?
-  reason: string;      // 'import-resolved' | 'same-file' | 'fuzzy-global'
+/** Same Function/Method gate as data-route resolution (`routeCallables`). */
+function routeCallableDefs(defs: readonly SymbolDefinition[]): readonly SymbolDefinition[] {
+  return defs.filter((def) => def.type === 'Function' || def.type === 'Method');
 }
 
 /**
- * Resolve a function call to its target node ID using priority strategy:
- * A. Check imported files first (highest confidence)
- * B. Check local file definitions
- * C. Fuzzy global search (lowest confidence)
- * 
- * Returns confidence score so agents know what to trust.
+ * Pick a same-file route handler from `lookupExactAll` hits.
+ *
+ * Graph nodes store 0-based `startLine`; `ExtractedRoute.lineNumber` is 1-based
+ * (`i + 1` in the tRPC scanner). File-index lookup is not callable-only, so
+ * drop Property/Variable/Const (and other non-callables) first. When several
+ * callables share a name, prefer the unique def whose node startLine equals
+ * `toZeroBasedLine(route.lineNumber)`. If that exact match is missing (common
+ * when the arrow starts on the line after `.mutation(`), take the unique def
+ * whose startLine is the nearest `>=` target. Zero or 2+ winners (or no line
+ * reader) → `undefined` (fail-open).
  */
-const resolveCallTarget = (
-  calledName: string,
-  currentFile: string,
-  symbolTable: SymbolTable,
-  importMap: ImportMap
-): ResolveResult | null => {
-  // Strategy B first (cheapest — single map lookup): Check local file
-  const localNodeId = symbolTable.lookupExact(currentFile, calledName);
-  if (localNodeId) {
-    return { nodeId: localNodeId, confidence: 0.85, reason: 'same-file' };
+function pickSameFileHandler(
+  defs: readonly SymbolDefinition[],
+  route: { lineNumber: number },
+  getStartLine?: (nodeId: string) => number | undefined,
+): SymbolDefinition | undefined {
+  defs = routeCallableDefs(defs);
+  if (defs.length === 1) return defs[0];
+  if (defs.length > 1 && getStartLine !== undefined) {
+    const targetLine = toZeroBasedLine(route.lineNumber);
+    const withLines = defs
+      .map((def) => ({ def, startLine: Number(getStartLine(def.nodeId)) }))
+      .filter((entry) => Number.isFinite(entry.startLine));
+    const exact = withLines.filter((entry) => entry.startLine === targetLine);
+    if (exact.length === 1) return exact[0].def;
+    const atOrAfter = withLines.filter((entry) => entry.startLine >= targetLine);
+    if (atOrAfter.length === 0) return undefined;
+    const nearestLine = Math.min(...atOrAfter.map((entry) => entry.startLine));
+    const nearest = atOrAfter.filter((entry) => entry.startLine === nearestLine);
+    return nearest.length === 1 ? nearest[0].def : undefined;
   }
+  return undefined;
+}
 
-  // Strategy A: Check if any definition of calledName is in an imported file
-  // Reversed: instead of iterating all imports and checking each, get all definitions
-  // and check if any is imported. O(definitions) instead of O(imports).
-  const allDefs = symbolTable.lookupFuzzy(calledName);
-  if (allDefs.length > 0) {
-    const importedFiles = importMap.get(currentFile);
-    if (importedFiles) {
-      for (const def of allDefs) {
-        if (importedFiles.has(def.filePath)) {
-          return { nodeId: def.nodeId, confidence: 0.9, reason: 'import-resolved' };
-        }
-      }
-    }
-
-    // Strategy C: Fuzzy global (no import match found)
-    const confidence = allDefs.length === 1 ? 0.5 : 0.3;
-    return { nodeId: allDefs[0].nodeId, confidence, reason: 'fuzzy-global' };
+/** Record one exported graph node into the incremental ExportedTypeMap. */
+export const accumulateExportedTypesFromParsedNode = (
+  result: ExportedTypeMap,
+  node: { id: string; properties?: Record<string, unknown> },
+  symbolTable: SymbolTableReader,
+): void => {
+  if (!node.properties?.isExported) return;
+  if (!node.properties?.filePath || !node.properties?.name) return;
+  const filePath = node.properties.filePath as string;
+  const name = node.properties.name as string;
+  if (!name || name.length > MAX_TYPE_NAME_LENGTH) return;
+  const defs = symbolTable.lookupExactAll(filePath, name);
+  const def = defs.find((d) => d.nodeId === node.id) ?? defs[0];
+  if (!def) return;
+  const typeName = def.returnType ?? def.declaredType;
+  if (!typeName || typeName.length > MAX_TYPE_NAME_LENGTH) return;
+  const simpleType = extractReturnTypeName(typeName) ?? typeName;
+  if (!simpleType) return;
+  let fileExports = result.get(filePath);
+  if (!fileExports) {
+    fileExports = new Map();
+    result.set(filePath, fileExports);
   }
-
-  return null;
+  if (fileExports.size < MAX_EXPORTS_PER_FILE) {
+    fileExports.set(name, simpleType);
+  }
 };
 
-/**
- * Filter out common built-in functions and noise
- * that shouldn't be tracked as calls
- */
-/** Pre-built set (module-level singleton) to avoid re-creating per call */
-const BUILT_IN_NAMES = new Set([
-  // JavaScript/TypeScript built-ins
-  'console', 'log', 'warn', 'error', 'info', 'debug',
-  'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-  'parseInt', 'parseFloat', 'isNaN', 'isFinite',
-  'encodeURI', 'decodeURI', 'encodeURIComponent', 'decodeURIComponent',
-  'JSON', 'parse', 'stringify',
-  'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt',
-  'Map', 'Set', 'WeakMap', 'WeakSet',
-  'Promise', 'resolve', 'reject', 'then', 'catch', 'finally',
-  'Math', 'Date', 'RegExp', 'Error',
-  'require', 'import', 'export',
-  'fetch', 'Response', 'Request',
-  // React hooks and common functions
-  'useState', 'useEffect', 'useCallback', 'useMemo', 'useRef', 'useContext',
-  'useReducer', 'useLayoutEffect', 'useImperativeHandle', 'useDebugValue',
-  'createElement', 'createContext', 'createRef', 'forwardRef', 'memo', 'lazy',
-  // Common array/object methods
-  'map', 'filter', 'reduce', 'forEach', 'find', 'findIndex', 'some', 'every',
-  'includes', 'indexOf', 'slice', 'splice', 'concat', 'join', 'split',
-  'push', 'pop', 'shift', 'unshift', 'sort', 'reverse',
-  'keys', 'values', 'entries', 'assign', 'freeze', 'seal',
-  'hasOwnProperty', 'toString', 'valueOf',
-  // Python built-ins
-  'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
-  'open', 'read', 'write', 'close', 'append', 'extend', 'update',
-  'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
-  'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
-  // Kotlin stdlib (IMPORTANT: keep in sync with parse-worker.ts BUILT_IN_NAMES)
-  'println', 'print', 'readLine', 'require', 'requireNotNull', 'check', 'assert', 'lazy', 'error',
-  'listOf', 'mapOf', 'setOf', 'mutableListOf', 'mutableMapOf', 'mutableSetOf',
-  'arrayOf', 'sequenceOf', 'also', 'apply', 'run', 'with', 'takeIf', 'takeUnless',
-  'TODO', 'buildString', 'buildList', 'buildMap', 'buildSet',
-  'repeat', 'synchronized',
-  // Kotlin coroutine builders & scope functions
-  'launch', 'async', 'runBlocking', 'withContext', 'coroutineScope',
-  'supervisorScope', 'delay',
-  // Kotlin Flow operators
-  'flow', 'flowOf', 'collect', 'emit', 'onEach', 'catch',
-  'buffer', 'conflate', 'distinctUntilChanged',
-  'flatMapLatest', 'flatMapMerge', 'combine',
-  'stateIn', 'shareIn', 'launchIn',
-  // Kotlin infix stdlib functions
-  'to', 'until', 'downTo', 'step',
-  // C/C++ standard library and common kernel helpers
-  'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf', 'vsnprintf',
-  'scanf', 'fscanf', 'sscanf',
-  'malloc', 'calloc', 'realloc', 'free', 'memcpy', 'memmove', 'memset', 'memcmp',
-  'strlen', 'strcpy', 'strncpy', 'strcat', 'strncat', 'strcmp', 'strncmp', 'strstr', 'strchr', 'strrchr',
-  'atoi', 'atol', 'atof', 'strtol', 'strtoul', 'strtoll', 'strtoull', 'strtod',
-  'sizeof', 'offsetof', 'typeof',
-  'assert', 'abort', 'exit', '_exit',
-  'fopen', 'fclose', 'fread', 'fwrite', 'fseek', 'ftell', 'rewind', 'fflush', 'fgets', 'fputs',
-  // Linux kernel common macros/helpers (not real call targets)
-  'likely', 'unlikely', 'BUG', 'BUG_ON', 'WARN', 'WARN_ON', 'WARN_ONCE',
-  'IS_ERR', 'PTR_ERR', 'ERR_PTR', 'IS_ERR_OR_NULL',
-  'ARRAY_SIZE', 'container_of', 'list_for_each_entry', 'list_for_each_entry_safe',
-  'min', 'max', 'clamp', 'abs', 'swap',
-  'pr_info', 'pr_warn', 'pr_err', 'pr_debug', 'pr_notice', 'pr_crit', 'pr_emerg',
-  'printk', 'dev_info', 'dev_warn', 'dev_err', 'dev_dbg',
-  'GFP_KERNEL', 'GFP_ATOMIC',
-  'spin_lock', 'spin_unlock', 'spin_lock_irqsave', 'spin_unlock_irqrestore',
-  'mutex_lock', 'mutex_unlock', 'mutex_init',
-  'kfree', 'kmalloc', 'kzalloc', 'kcalloc', 'krealloc', 'kvmalloc', 'kvfree',
-  'get', 'put',
-  // Swift/iOS built-ins and standard library
-  'print', 'debugPrint', 'dump', 'fatalError', 'precondition', 'preconditionFailure',
-  'assert', 'assertionFailure', 'NSLog',
-  'abs', 'min', 'max', 'zip', 'stride', 'sequence', 'repeatElement',
-  'swap', 'withUnsafePointer', 'withUnsafeMutablePointer', 'withUnsafeBytes',
-  'autoreleasepool', 'unsafeBitCast', 'unsafeDowncast', 'numericCast',
-  'type', 'MemoryLayout',
-  // Swift collection/string methods (common noise)
-  'map', 'flatMap', 'compactMap', 'filter', 'reduce', 'forEach', 'contains',
-  'first', 'last', 'prefix', 'suffix', 'dropFirst', 'dropLast',
-  'sorted', 'reversed', 'enumerated', 'joined', 'split',
-  'append', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast',
-  'isEmpty', 'count', 'index', 'startIndex', 'endIndex',
-  // UIKit/Foundation common methods (noise in call graph)
-  'addSubview', 'removeFromSuperview', 'layoutSubviews', 'setNeedsLayout',
-  'layoutIfNeeded', 'setNeedsDisplay', 'invalidateIntrinsicContentSize',
-  'addTarget', 'removeTarget', 'addGestureRecognizer',
-  'addConstraint', 'addConstraints', 'removeConstraint', 'removeConstraints',
-  'NSLocalizedString', 'Bundle',
-  'reloadData', 'reloadSections', 'reloadRows', 'performBatchUpdates',
-  'register', 'dequeueReusableCell', 'dequeueReusableSupplementaryView',
-  'beginUpdates', 'endUpdates', 'insertRows', 'deleteRows', 'insertSections', 'deleteSections',
-  'present', 'dismiss', 'pushViewController', 'popViewController', 'popToRootViewController',
-  'performSegue', 'prepare',
-  // GCD / async
-  'DispatchQueue', 'async', 'sync', 'asyncAfter',
-  'Task', 'withCheckedContinuation', 'withCheckedThrowingContinuation',
-  // Combine
-  'sink', 'store', 'assign', 'receive', 'subscribe',
-  // Notification / KVO
-  'addObserver', 'removeObserver', 'post', 'NotificationCenter',
-]);
-
-const isBuiltInOrNoise = (name: string): boolean => BUILT_IN_NAMES.has(name);
-
-/**
- * Fast path: resolve pre-extracted call sites from workers.
- * No AST parsing — workers already extracted calledName + sourceId.
- * This function only does symbol table lookups + graph mutations.
- */
-export const processCallsFromExtracted = async (
+/** Build ExportedTypeMap from graph nodes — used for the worker path where the
+ *  sequential TypeEnv is not available in the main thread. Collects
+ *  returnType/declaredType from exported symbols with known types. */
+export function buildExportedTypeMapFromGraph(
   graph: KnowledgeGraph,
-  extractedCalls: ExtractedCall[],
-  symbolTable: SymbolTable,
-  importMap: ImportMap,
-  onProgress?: (current: number, total: number) => void
-) => {
-  // Group by file for progress reporting
-  const byFile = new Map<string, ExtractedCall[]>();
-  for (const call of extractedCalls) {
-    let list = byFile.get(call.filePath);
-    if (!list) {
-      list = [];
-      byFile.set(call.filePath, list);
-    }
-    list.push(call);
-  }
-
-  const totalFiles = byFile.size;
-  let filesProcessed = 0;
-
-  for (const [_filePath, calls] of byFile) {
-    filesProcessed++;
-    if (filesProcessed % 100 === 0) {
-      onProgress?.(filesProcessed, totalFiles);
-      await yieldToEventLoop();
-    }
-
-    for (const call of calls) {
-      const resolved = resolveCallTarget(
-        call.calledName,
-        call.filePath,
-        symbolTable,
-        importMap
-      );
-      if (!resolved) continue;
-
-      const relId = generateId('CALLS', `${call.sourceId}:${call.calledName}->${resolved.nodeId}`);
-      graph.addRelationship({
-        id: relId,
-        sourceId: call.sourceId,
-        targetId: resolved.nodeId,
-        type: 'CALLS',
-        confidence: resolved.confidence,
-        reason: resolved.reason,
-      });
-    }
-  }
-
-  onProgress?.(totalFiles, totalFiles);
-};
+  symbolTable: SymbolTableReader,
+): ExportedTypeMap {
+  const result: ExportedTypeMap = new Map();
+  graph.forEachNode((node) => {
+    accumulateExportedTypesFromParsedNode(result, node, symbolTable);
+  });
+  return result;
+}
 
 /**
- * Resolve pre-extracted Laravel routes to CALLS edges from route files to controller methods.
+ * Confidence for route → controller-method CALLS edges. Framework-route
+ * controller references (e.g. `OrderController::class` in `routes/web.php`)
+ * resolve by global class name, so this matches the legacy `global`-tier
+ * confidence the tiered resolver previously assigned these edges.
+ */
+const ROUTE_EDGE_CONFIDENCE = 0.5;
+
+/**
+ * Resolve a route's controller class from its normalized dot-joined
+ * fully-qualified name (threaded by the Laravel extractor from a `use`/`::class`
+ * reference). Two strategies, in order:
+ *
+ *   1. Direct qualified lookup — works when the type registry keys the class by
+ *      its FQN (block-form namespaces, non-PHP frameworks, seeded test models).
+ *   2. PSR-4 file-path disambiguation — PHP's common statement-form namespace
+ *      (`namespace App\Http\Controllers;`) leaves the structure-phase
+ *      `qualifiedName` as the *short* class name, so the registry has no FQN
+ *      key. Instead, take the FQN's last segment as the class name, fetch the
+ *      same-short-name candidates, and pick the one whose file path's tail
+ *      matches the FQN's namespace tail (e.g. `App.Admin.OrderController` ↔
+ *      `app/Admin/OrderController.php`). Requires ≥2 trailing segments (class +
+ *      ≥1 namespace segment) and a unique winner — conservative, so a
+ *      non-PSR-4 layout falls through to short-name resolution rather than
+ *      guessing.
+ *
+ * Returns the resolved class, or `undefined` when the FQN cannot be uniquely
+ * resolved (the caller then falls back to bare short-name resolution).
+ */
+function resolveControllerByQualifiedName(
+  model: SemanticModel,
+  fqn: string,
+): SymbolDefinition | undefined {
+  const direct = model.types.lookupClassByQualifiedName(fqn);
+  if (direct.length === 1) return direct[0];
+
+  const fqnSegments = fqn.split('.');
+  const shortName = fqnSegments[fqnSegments.length - 1];
+  if (!shortName) return undefined;
+
+  const candidates = model.types.lookupClassByName(shortName);
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 0) return undefined;
+
+  let best: SymbolDefinition | undefined;
+  let bestScore = 0;
+  let tie = false;
+  for (const candidate of candidates) {
+    // Compare the FQN's namespace tail against the file path's directory tail
+    // (PSR-4: `App\Admin\OrderController` ↔ `app/Admin/OrderController.php`).
+    // Split on `/` (a path separator normalizeQualifiedName does not touch).
+    const fileBase = candidate.filePath.replace(/\.[^./]+$/, '');
+    const fileSegments = fileBase.split('/').filter((s) => s.length > 0);
+    let score = 0;
+    while (
+      score < fqnSegments.length &&
+      score < fileSegments.length &&
+      fqnSegments[fqnSegments.length - 1 - score].toLowerCase() ===
+        fileSegments[fileSegments.length - 1 - score].toLowerCase()
+    ) {
+      score++;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+      tie = false;
+    } else if (score === bestScore) {
+      tie = true;
+    }
+  }
+  // Need the class name + at least one namespace segment to disambiguate, and a
+  // single unambiguous winner.
+  return bestScore >= 2 && !tie ? best : undefined;
+}
+
+/**
+ * Create CALLS edges from extracted framework routes (e.g. Laravel) to their
+ * controller methods. Runs for all languages — independent of call resolution.
+ *
+ * Resolution is registry-based (RING4-2 #943 retired the tiered resolver):
+ *   - Controller: **qualified-first** (see {@link resolveControllerByQualifiedName}).
+ *     When the routes file disambiguated the controller, the Laravel extractor
+ *     threads `route.controllerQualifiedName` (a `use` import — incl. aliased
+ *     `use … as X;` — or an inline qualified `::class`, normalized to the dot-
+ *     joined key shape). The emitter resolves it by direct qualified lookup, or
+ *     by PSR-4 file-path disambiguation when PHP's statement-form namespace left
+ *     the registry keyed only by the short name — either way picking the
+ *     specific class even when the short name is globally duplicated (the common
+ *     admin/public `OrderController` split) or aliased. It falls back to the
+ *     global short-name lookup (`lookupClassByName`), which still skips on
+ *     ambiguity (`length !== 1`) — so a bare, genuinely ambiguous short name
+ *     with no `use`/FQN correctly produces no (wrong) edge.
+ *   - Method: resolved within the controller's own file via the symbol table
+ *     (the legacy emitter only accepted same-file method resolutions).
+ *
+ * Edge confidence is a flat {@link ROUTE_EDGE_CONFIDENCE}. Route CALLS edges
+ * are gated downstream by the process-trace (`MIN_TRACE_CONFIDENCE`) and
+ * large-graph community (`MIN_CONFIDENCE_LARGE`) thresholds (both 0.5); a
+ * resolved edge lands at exactly 0.5 and passes (`>= 0.5`). The guessed-method
+ * fallback edge (`× 0.8` = 0.4) sits below the gate and is excluded from those
+ * passes — acceptable for an edge whose target method could not be resolved.
  */
 export const processRoutesFromExtracted = async (
   graph: KnowledgeGraph,
   extractedRoutes: ExtractedRoute[],
-  symbolTable: SymbolTable,
-  importMap: ImportMap,
-  onProgress?: (current: number, total: number) => void
+  model: SemanticModel,
+  onProgress?: (current: number, total: number) => void,
 ) => {
   for (let i = 0; i < extractedRoutes.length; i++) {
     const route = extractedRoutes[i];
@@ -474,33 +258,62 @@ export const processRoutesFromExtracted = async (
       await yieldToEventLoop();
     }
 
-    if (!route.controllerName || !route.methodName) continue;
+    if (!route.methodName) continue;
 
-    // Resolve controller class in symbol table
-    const controllerDefs = symbolTable.lookupFuzzy(route.controllerName);
-    if (controllerDefs.length === 0) continue;
-
-    // Prefer import-resolved match
-    const importedFiles = importMap.get(route.filePath);
-    let controllerDef = controllerDefs[0];
-    let confidence = controllerDefs.length === 1 ? 0.7 : 0.5;
-
-    if (importedFiles) {
-      for (const def of controllerDefs) {
-        if (importedFiles.has(def.filePath)) {
-          controllerDef = def;
-          confidence = 0.9;
-          break;
-        }
-      }
+    // tRPC routes carry NO controller: a router is an object binding, not a
+    // class, so the extractor leaves controllerName unset and names the
+    // handler from the callback identifier when present, otherwise from its
+    // object-literal key. Bind the same-file symbol directly.
+    // No unique match → skip, fail-open. Laravel routes always set
+    // controllerName and Django routes leave methodName null, so this
+    // branch is tRPC-only by construction — the laravel guessed-method
+    // fallback below never sees a controller-less route.
+    if (!route.controllerName) {
+      const handler = pickSameFileHandler(
+        model.symbols.lookupExactAll(route.filePath, route.methodName),
+        route,
+        (id) => graph.getNode(id)?.properties.startLine as number | undefined,
+      );
+      if (!handler) continue;
+      const sourceId = generateId('File', route.filePath);
+      const relId = generateId('CALLS', sourceId + ':route->' + handler.nodeId);
+      graph.addRelationship({
+        id: relId,
+        sourceId,
+        targetId: handler.nodeId,
+        type: 'CALLS',
+        confidence: ROUTE_EDGE_CONFIDENCE,
+        reason: 'trpc-route',
+      });
+      continue;
     }
 
-    // Find the method on the controller
-    const methodId = symbolTable.lookupExact(controllerDef.filePath, route.methodName);
+    // Resolve the controller class. Qualified-first: when the routes file
+    // disambiguated the controller (a `use` import or inline `::class` FQN, both
+    // normalized to the registry's dot-joined key shape by the extractor), look
+    // it up by qualified name — this resolves aliased imports and same-short-name
+    // controllers in different namespaces. Fall back to the global short-name
+    // lookup, which still refuses ambiguous matches (`length !== 1 → skip`),
+    // mirroring the legacy global tier.
+    let controllerDef: SymbolDefinition | undefined;
+    if (route.controllerQualifiedName) {
+      controllerDef = resolveControllerByQualifiedName(model, route.controllerQualifiedName);
+    }
+    if (!controllerDef) {
+      const controllerDefs = model.types.lookupClassByName(route.controllerName);
+      if (controllerDefs.length !== 1) continue;
+      controllerDef = controllerDefs[0];
+    }
+
+    const confidence = ROUTE_EDGE_CONFIDENCE;
+
+    // Method must live in the controller's own file (the legacy emitter only
+    // accepted same-file method resolutions).
+    const methodDefs = model.symbols.lookupExactAll(controllerDef.filePath, route.methodName);
+    const methodId = methodDefs[0]?.nodeId;
     const sourceId = generateId('File', route.filePath);
 
     if (!methodId) {
-      // Construct method ID manually
       const guessedId = generateId('Method', `${controllerDef.filePath}:${route.methodName}`);
       const relId = generateId('CALLS', `${sourceId}:route->${guessedId}`);
       graph.addRelationship({
@@ -526,4 +339,460 @@ export const processRoutesFromExtracted = async (
   }
 
   onProgress?.(extractedRoutes.length, extractedRoutes.length);
+};
+
+/**
+ * Resolve each route's handler to a real symbol UID, keyed by the route's
+ * `(method, url)` identity (`routeNodeKey` — the same key the routes phase uses
+ * for the `Route` node). This is the Part 2 (#2138) groundwork that lets
+ * `HttpRouteExtractor.extractProvidersGraph` read the handler symbol from the
+ * graph instead of re-parsing source via `getDetections()`.
+ *
+ * Two route shapes, one resolution target — `(filePath, name) → nodeId`:
+ *   - Laravel framework routes (`ExtractedRoute`) carry `controllerName` +
+ *     `methodName`; resolve the controller (qualified-first) then the method in
+ *     the controller's own file (mirrors `processRoutesFromExtracted`).
+ *   - Decorator routes (`ExtractedDecoratorRoute`, e.g. Spring/FastAPI) carry
+ *     `handlerName` (the decorated method, captured at extraction); resolve it
+ *     directly in the route's own file.
+ *
+ * First-writer-wins per route identity, matching the routes phase's dedup (it
+ * keeps the first route registered for a `(method, url)` key and counts the rest
+ * as duplicates). The first route to claim a key reserves it **even when its
+ * handler is unresolvable**, so a later same-key route can never stamp its
+ * handler onto the first route's Route node (the routes phase made that first
+ * route the node-winner). Keying is `routeNodeKey(method, url)` (#2289): a
+ * same-URL multi-verb pair (`GET /x` + `POST /x`) resolves two handlers, one per
+ * node; method-less / wildcard routes key by URL alone, byte-identical to the
+ * pre-#2289 behavior. Routes whose handler cannot be *uniquely* resolved (no
+ * name, zero matches, or an ambiguous same-name match) carry no
+ * `handlerSymbolId`; the extractor then falls back to source scan for that route
+ * (fail-open, no regression, never a wrong handler).
+ */
+export function resolveRouteHandlerSymbols(
+  model: SemanticModel,
+  extractedRoutes: readonly ExtractedRoute[],
+  decoratorRoutes: readonly ExtractedDecoratorRoute[],
+  routeContext?: RouteHandlerResolutionContext,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  // Route identities already claimed by an earlier route (resolved or not).
+  // Mirrors the routes phase `addRoute` first-writer-wins so the handler we
+  // stamp always belongs to the route that actually won the Route node.
+  const claimed = new Set<string>();
+
+  // Resolve a single same-file symbol by name. Exactly one match → its nodeId.
+  // Zero or many matches → undefined (fail-open). tRPC same-name handlers
+  // use pickSameFileHandler at the controller-less call site instead.
+  const uniqueSymbolId = (filePath: string, name: string): string | undefined => {
+    const defs = model.symbols.lookupExactAll(filePath, name);
+    return defs.length === 1 ? defs[0]?.nodeId : undefined;
+  };
+
+  const uniqueById = (defs: readonly SymbolDefinition[]): SymbolDefinition | undefined => {
+    const byId = new Map(defs.map((def) => [def.nodeId, def]));
+    return byId.size === 1 ? byId.values().next().value : undefined;
+  };
+
+  const routeCallables = (defs: readonly SymbolDefinition[]): readonly SymbolDefinition[] =>
+    routeCallableDefs(defs);
+
+  const exportedRouteCallables = (
+    defs: readonly SymbolDefinition[],
+  ): readonly SymbolDefinition[] =>
+    routeContext === undefined
+      ? []
+      : routeCallables(defs).filter((def) => routeContext.isExportedSymbol(def.nodeId));
+
+  const filesByPath = new Map(routeContext?.files.map((file) => [file.filePath, file]) ?? []);
+
+  const uniqueImport = (filePath: string, localName: string): ParsedImport | undefined => {
+    const matches = (filesByPath.get(filePath)?.parsedImports ?? []).filter(
+      (parsedImport) =>
+        'localName' in parsedImport &&
+        parsedImport.localName === localName &&
+        parsedImport.kind !== 'dynamic-unresolved',
+    );
+    return matches.length === 1 ? matches[0] : undefined;
+  };
+
+  const importedTarget = (
+    filePath: string,
+    localName: string,
+  ): { parsedImport: ParsedImport; targetFile: string } | undefined => {
+    if (routeContext === undefined) return undefined;
+    const parsedImport = uniqueImport(filePath, localName);
+    if (parsedImport === undefined) return undefined;
+    const targetFile = routeContext.resolveImportTarget(parsedImport, filePath);
+    return targetFile === null ? undefined : { parsedImport, targetFile };
+  };
+
+  const resolveDataRouteHandler = (filePath: string, designator: string): string | undefined => {
+    const parts = designator.split('.');
+    if (parts.length === 1) {
+      const local = uniqueById(routeCallables(model.symbols.lookupExactAll(filePath, designator)));
+      if (local !== undefined) return local.nodeId;
+
+      const imported = importedTarget(filePath, designator);
+      if (
+        imported === undefined ||
+        imported.parsedImport.kind === 'namespace' ||
+        imported.parsedImport.kind === 'wildcard' ||
+        !('importedName' in imported.parsedImport)
+      ) {
+        return undefined;
+      }
+      if (imported.parsedImport.importedName === 'default') {
+        // ParsedFile does not carry explicit default-export provenance. Fail
+        // closed rather than infer an unrelated named export from the module.
+        return undefined;
+      }
+      return uniqueById(
+        exportedRouteCallables(
+          model.symbols.lookupExactAll(imported.targetFile, imported.parsedImport.importedName),
+        ),
+      )?.nodeId;
+    }
+    if (parts.length !== 2) return undefined;
+
+    const [receiver, member] = parts;
+    const localOwner = uniqueById(model.symbols.lookupExactAll(filePath, receiver));
+    if (localOwner !== undefined) {
+      return uniqueById(model.methods.lookupAllByOwner(localOwner.nodeId, member))?.nodeId;
+    }
+
+    const imported = importedTarget(filePath, receiver);
+    if (imported === undefined || imported.parsedImport.kind === 'wildcard') return undefined;
+    if (imported.parsedImport.kind === 'namespace') {
+      return uniqueById(
+        exportedRouteCallables(model.symbols.lookupExactAll(imported.targetFile, member)),
+      )?.nodeId;
+    }
+    if (!('importedName' in imported.parsedImport)) return undefined;
+    if (imported.parsedImport.importedName === 'default') return undefined;
+    const owner = uniqueById(
+      model.symbols
+        .lookupExactAll(imported.targetFile, imported.parsedImport.importedName)
+        .filter((def) => routeContext?.isExportedSymbol(def.nodeId) === true),
+    );
+    return owner === undefined
+      ? undefined
+      : uniqueById(model.methods.lookupAllByOwner(owner.nodeId, member))?.nodeId;
+  };
+
+  const claim = (
+    routePath: string | null,
+    prefix: string | null,
+    httpMethod: string | null | undefined,
+    symbolId: string | undefined,
+  ) => {
+    // An empty path is a valid, pathless mapping and normalizes to either `/`
+    // or its class/router prefix. Only null means the extractor had no route.
+    if (routePath === null) return;
+    const url = normalizeExtractedRoutePath(routePath, prefix);
+    const key = routeNodeKey(normalizeRouteMethod(httpMethod), url);
+    if (claimed.has(key)) return; // first-writer-wins: later same-key routes can't override
+    claimed.add(key);
+    if (symbolId) out.set(key, symbolId);
+  };
+
+  // Laravel framework routes — controller class + method name.
+  for (const route of extractedRoutes) {
+    let methodId: string | undefined;
+    if (route.controllerName && route.methodName) {
+      let controllerDef: SymbolDefinition | undefined;
+      if (route.controllerQualifiedName) {
+        controllerDef = resolveControllerByQualifiedName(model, route.controllerQualifiedName);
+      }
+      if (!controllerDef) {
+        const controllerDefs = model.types.lookupClassByName(route.controllerName);
+        if (controllerDefs.length === 1) controllerDef = controllerDefs[0];
+      }
+      if (controllerDef) methodId = uniqueSymbolId(controllerDef.filePath, route.methodName);
+    } else if (!route.controllerName && route.methodName) {
+      methodId = pickSameFileHandler(
+        model.symbols.lookupExactAll(route.filePath, route.methodName),
+        route,
+        routeContext?.nodeStartLine,
+      )?.nodeId;
+    }
+    claim(route.routePath, route.prefix ?? null, route.httpMethod, methodId);
+  }
+
+  const dataHandlerByRoute = new Map<ExtractedDecoratorRoute, string>();
+  const dataHandlersByIdentity = new Map<
+    string,
+    { handlers: Set<string>; hasUnresolved: boolean }
+  >();
+  for (const dr of decoratorRoutes) {
+    if (dr.source !== DATA_ROUTE_TABLE_SOURCE || !dr.handlerName || !dr.routePath) continue;
+    const handlerId = resolveDataRouteHandler(dr.filePath, dr.handlerName);
+    const url = normalizeExtractedRoutePath(dr.routePath, dr.prefix ?? null);
+    const key = routeNodeKey(normalizeRouteMethod(dr.httpMethod), url);
+    const state = dataHandlersByIdentity.get(key) ?? {
+      handlers: new Set<string>(),
+      hasUnresolved: false,
+    };
+    if (handlerId === undefined) {
+      state.hasUnresolved = true;
+    } else {
+      dataHandlerByRoute.set(dr, handlerId);
+      state.handlers.add(handlerId);
+    }
+    dataHandlersByIdentity.set(key, state);
+  }
+
+  // A language that resolves its own handlers sees only this seam: the
+  // model, and the workspace files an import local name resolves to.
+  const importTargetsFor = (fromFile: string, localName: string): readonly string[] => {
+    const parsedImport = uniqueImport(fromFile, localName);
+    if (parsedImport === undefined || routeContext?.resolveImportTargets === undefined) return [];
+    return routeContext.resolveImportTargets(parsedImport, fromFile);
+  };
+
+  const providerContext = { model, importTargetsFor };
+  const decoratorHandlerId = (dr: ExtractedDecoratorRoute): string | undefined => {
+    if (dr.source === DATA_ROUTE_TABLE_SOURCE) return dataHandlerByRoute.get(dr);
+    const providerHandler = routeContext?.providerRouteHandler?.(dr.filePath);
+    if (providerHandler) return providerHandler(dr, providerContext);
+    return dr.handlerName ? uniqueSymbolId(dr.filePath, dr.handlerName) : undefined;
+  };
+
+  // Decorator routes (Spring / FastAPI / generic) — the decorated handler in
+  // the route's own file, unless the route's language resolves its own
+  // handlers. Data tables additionally suppress an identity when duplicate
+  // entries resolve to different handlers: recording either one would invent a
+  // single-winner dispatch that the loop does not prove.
+  for (const dr of decoratorRoutes) {
+    const handlerId = decoratorHandlerId(dr);
+    // An unproven data-table entry never becomes a Route node, so it must not
+    // reserve the identity and suppress a later, valid framework declaration.
+    if (dr.source === DATA_ROUTE_TABLE_SOURCE && handlerId === undefined) continue;
+    if (dr.source === DATA_ROUTE_TABLE_SOURCE && dr.routePath) {
+      const url = normalizeExtractedRoutePath(dr.routePath, dr.prefix ?? null);
+      const key = routeNodeKey(normalizeRouteMethod(dr.httpMethod), url);
+      const state = dataHandlersByIdentity.get(key);
+      if (state === undefined || state.hasUnresolved || state.handlers.size !== 1) continue;
+    }
+    claim(dr.routePath, dr.prefix ?? null, dr.httpMethod, handlerId);
+  }
+
+  return out;
+}
+
+/** Common method names on response/data objects that are NOT property accesses */
+// Properties/methods to ignore when extracting consumer accessed keys from `data.X` patterns.
+// Avoids false positives from Fetch API, Array, Object, Promise, and DOM access on variables
+// that happen to share names with response variables (data, result, response, etc.).
+const RESPONSE_ACCESS_BLOCKLIST = new Set([
+  // Fetch/Response API
+  'json',
+  'text',
+  'blob',
+  'arrayBuffer',
+  'formData',
+  'ok',
+  'status',
+  'headers',
+  'clone',
+  // Promise
+  'then',
+  'catch',
+  'finally',
+  // Array
+  'map',
+  'filter',
+  'forEach',
+  'reduce',
+  'find',
+  'some',
+  'every',
+  'push',
+  'pop',
+  'shift',
+  'unshift',
+  'splice',
+  'slice',
+  'concat',
+  'join',
+  'sort',
+  'reverse',
+  'includes',
+  'indexOf',
+  // Object
+  'length',
+  'toString',
+  'valueOf',
+  'keys',
+  'values',
+  'entries',
+  // DOM methods — file-download patterns often reuse `data`/`response` variable names
+  'appendChild',
+  'removeChild',
+  'insertBefore',
+  'replaceChild',
+  'replaceChildren',
+  'createElement',
+  'getElementById',
+  'querySelector',
+  'querySelectorAll',
+  'setAttribute',
+  'getAttribute',
+  'removeAttribute',
+  'hasAttribute',
+  'addEventListener',
+  'removeEventListener',
+  'dispatchEvent',
+  'classList',
+  'className',
+  'parentNode',
+  'parentElement',
+  'childNodes',
+  'children',
+  'nextSibling',
+  'previousSibling',
+  'firstChild',
+  'lastChild',
+  'click',
+  'focus',
+  'blur',
+  'submit',
+  'reset',
+  'innerHTML',
+  'outerHTML',
+  'textContent',
+  'innerText',
+]);
+
+/**
+ * Extract property access keys from a consumer file's source code near fetch calls.
+ *
+ * Looks for destructuring (`const { data } = await res.json()`), property access
+ * (`response.data`), and optional chaining (`data?.key`). Returns deduplicated
+ * top-level property names accessed on the response. Scans the whole file, so
+ * all accessed keys are attributed to each fetch — acceptable for regex-based
+ * extraction.
+ */
+export const extractConsumerAccessedKeys = (content: string): string[] => {
+  const keys = new Set<string>();
+
+  // Pattern 1: Destructuring from .json() — const { key1, key2 } = await res.json()
+  // Also matches: const { key1, key2 } = await (await fetch(...)).json()
+  const destructurePattern =
+    /(?:const|let|var)\s+\{([^}]+)\}\s*=\s*(?:await\s+)?(?:\w+\.json\s*\(\)|(?:await\s+)?(?:fetch|axios|got)\s*\([^)]*\)(?:\.then\s*\([^)]*\))?(?:\.json\s*\(\))?)/g;
+  let match;
+  while ((match = destructurePattern.exec(content)) !== null) {
+    const destructuredBody = match[1];
+    // Extract identifiers from destructuring, handling renamed bindings (key: alias)
+    const keyPattern = /(\w+)\s*(?::\s*\w+)?/g;
+    let keyMatch;
+    while ((keyMatch = keyPattern.exec(destructuredBody)) !== null) {
+      keys.add(keyMatch[1]);
+    }
+  }
+
+  // Pattern 2: Destructuring from a data/result/response/json variable
+  // e.g., const { items, total } = data; or const { error } = result;
+  const dataVarDestructure =
+    /(?:const|let|var)\s+\{([^}]+)\}\s*=\s*(?:data|result|response|json|body|res)\b/g;
+  while ((match = dataVarDestructure.exec(content)) !== null) {
+    const destructuredBody = match[1];
+    const keyPattern = /(\w+)\s*(?::\s*\w+)?/g;
+    let keyMatch;
+    while ((keyMatch = keyPattern.exec(destructuredBody)) !== null) {
+      keys.add(keyMatch[1]);
+    }
+  }
+
+  // Pattern 3: Property access on common response variable names
+  // Matches: data.key, response.key, result.key, json.key, body.key
+  // Also matches optional chaining: data?.key
+  const propAccessPattern = /\b(?:data|response|result|json|body|res)\s*(?:\?\.|\.)(\w+)/g;
+  while ((match = propAccessPattern.exec(content)) !== null) {
+    const key = match[1];
+    // Skip common method calls that aren't property accesses
+    if (!RESPONSE_ACCESS_BLOCKLIST.has(key)) {
+      keys.add(key);
+    }
+  }
+
+  return [...keys];
+};
+
+/**
+ * Create FETCHES edges from extracted fetch() calls to matching Route nodes.
+ * When consumerContents is provided, extracts property access patterns from
+ * consumer files and encodes them in the edge reason field.
+ *
+ * Matching stays URL-only (#2289): a verb-less consumer (a `fetch()` call has
+ * no statically-known HTTP method) matches a route by URL and connects to
+ * **every** Route node sharing that URL — i.e. both the `GET /x` and `POST /x`
+ * nodes when a URL carries multiple verbs. `routeUrlToKeys` therefore maps each
+ * route URL to the list of `routeNodeKey` identities at that URL; a single-verb
+ * (or method-less) URL has a one-element list, keeping edges byte-identical to
+ * the pre-#2289 behavior.
+ */
+export const processNextjsFetchRoutes = (
+  graph: KnowledgeGraph,
+  fetchCalls: ExtractedFetchCall[],
+  routeUrlToKeys: Map<string, string[]>, // routeURL → route node keys at that URL
+  consumerContents?: Map<string, string>, // filePath → file content
+) => {
+  // Pre-count how many route URLs each consumer file matches (for confidence
+  // attribution). Counts once per call that matches any URL — independent of how
+  // many verbs share that URL — so the multi-fetch heuristic is unchanged.
+  const routeCountByFile = new Map<string, number>();
+  for (const call of fetchCalls) {
+    const normalized = normalizeFetchURL(call.fetchURL);
+    if (!normalized) continue;
+    for (const routeURL of routeUrlToKeys.keys()) {
+      if (routeMatches(normalized, routeURL)) {
+        routeCountByFile.set(call.filePath, (routeCountByFile.get(call.filePath) ?? 0) + 1);
+        break;
+      }
+    }
+  }
+
+  for (const call of fetchCalls) {
+    const normalized = normalizeFetchURL(call.fetchURL);
+    if (!normalized) continue;
+
+    for (const [routeURL, routeKeys] of routeUrlToKeys) {
+      if (routeMatches(normalized, routeURL)) {
+        const sourceId = generateId('File', call.filePath);
+
+        // Extract consumer accessed keys if file content is available
+        let reason = 'fetch-url-match';
+        if (consumerContents) {
+          const content = consumerContents.get(call.filePath);
+          if (content) {
+            const accessedKeys = extractConsumerAccessedKeys(content);
+            if (accessedKeys.length > 0) {
+              reason = `fetch-url-match|keys:${accessedKeys.join(',')}`;
+            }
+          }
+        }
+
+        // Encode multi-fetch count so downstream can set confidence
+        const fetchCount = routeCountByFile.get(call.filePath) ?? 1;
+        if (fetchCount > 1) {
+          reason = `${reason}|fetches:${fetchCount}`;
+        }
+
+        // Connect to every Route node at this URL (one per verb).
+        for (const routeKey of routeKeys) {
+          const routeNodeId = generateId('Route', routeKey);
+          graph.addRelationship({
+            id: generateId('FETCHES', `${sourceId}->${routeNodeId}`),
+            sourceId,
+            targetId: routeNodeId,
+            type: 'FETCHES',
+            confidence: 0.9,
+            reason,
+          });
+        }
+        break;
+      }
+    }
+  }
 };

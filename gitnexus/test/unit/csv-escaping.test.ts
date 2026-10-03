@@ -10,21 +10,30 @@ import {
   escapeCSVNumber,
   sanitizeUTF8,
   isBinaryContent,
-} from '../../src/core/kuzu/csv-generator.js';
+} from '../../src/core/lbug/csv-generator.js';
 
 // ─── escapeCSVField ──────────────────────────────────────────────────
 
 describe('escapeCSVField', () => {
-  it('returns empty quoted string for null', () => {
-    expect(escapeCSVField(null)).toBe('""');
+  it('returns an unquoted NULL field for null', () => {
+    expect(escapeCSVField(null)).toBe('');
   });
 
-  it('returns empty quoted string for undefined', () => {
-    expect(escapeCSVField(undefined)).toBe('""');
+  it('returns an unquoted NULL field for undefined', () => {
+    expect(escapeCSVField(undefined)).toBe('');
   });
 
-  it('returns quoted empty string for empty input', () => {
-    expect(escapeCSVField('')).toBe('""');
+  it('preserves the legacy NULL meaning of empty input', () => {
+    expect(escapeCSVField('')).toBe('');
+  });
+
+  it('returns a NULL field when sanitization removes the entire value', () => {
+    expect(escapeCSVField('\x00\x01')).toBe('');
+  });
+
+  it('keeps whitespace and zero as quoted non-null values', () => {
+    expect(escapeCSVField(' ')).toBe('" "');
+    expect(escapeCSVField(0)).toBe('"0"');
   });
 
   it('wraps simple string in quotes', () => {
@@ -169,5 +178,24 @@ describe('isBinaryContent', () => {
     // Binary content past 1000 chars should be ignored
     const text = 'a'.repeat(1000) + '\x00'.repeat(500);
     expect(isBinaryContent(text)).toBe(false);
+  });
+
+  // #2889 — every file enters through a lossy `utf-8` decode, so an embedded
+  // binary payload reaches this function as U+FFFD, never as the raw bytes.
+  it('returns true when >10% U+FFFD replacement characters', () => {
+    const decoded = 'a'.repeat(80) + '�'.repeat(20);
+    expect(isBinaryContent(decoded)).toBe(true);
+  });
+
+  it('counts U+FFFD toward the same threshold as control bytes', () => {
+    // 5 control + 6 replacement = 11% of 100 — neither group crosses 10% alone.
+    const mixed = 'a'.repeat(89) + '\x01'.repeat(5) + '�'.repeat(6);
+    expect(isBinaryContent(mixed)).toBe(true);
+  });
+
+  it('returns false for text carrying a few replacement characters', () => {
+    // A mis-decoded latin-1 comment in an otherwise clean file stays indexable.
+    const mostlyText = 'a'.repeat(95) + '�'.repeat(5);
+    expect(isBinaryContent(mostlyText)).toBe(false);
   });
 });

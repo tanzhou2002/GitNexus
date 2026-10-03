@@ -1,14 +1,20 @@
 /**
  * AI Context Generator
- * 
+ *
  * Creates AGENTS.md and CLAUDE.md with full inline GitNexus context.
- * AGENTS.md is the standard read by Cursor, Windsurf, OpenCode, Cline, etc.
+ * AGENTS.md is the standard read by Cursor, Windsurf, OpenCode, Codex, Cline, CodeBuddy, Qoder, etc.
  * CLAUDE.md is for Claude Code which only reads that file.
  */
 
+import { GITNEXUS_DIR } from '../storage/storage-constants.js';
+import { storeRootOfCheckoutSlot } from '../storage/shared-store.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { type GeneratedSkillInfo } from './generated-skill.js';
+import { STANDARD_SKILL_CATALOG } from './standard-skills.js';
+import { isEnoent } from './editor-targets.js';
+import { logger } from '../core/logger.js';
 
 // ESM equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -19,12 +25,59 @@ interface RepoStats {
   nodes?: number;
   edges?: number;
   communities?: number;
-  clusters?: number;       // Aggregated cluster count (what tools show)
+  clusters?: number; // Aggregated cluster count (what tools show)
   processes?: number;
+}
+
+export interface AIContextOptions {
+  skipAgentsMd?: boolean;
+  noStats?: boolean;
+  skipSkills?: boolean;
+  /**
+   * Default branch used by the generated regression-compare example (#243).
+   * Resolved by the CLI (CLI flag > `.gitnexusrc` > auto-detect > "main"); a
+   * plain caller that omits it gets "main", preserving prior behavior.
+   */
+  defaultBranch?: string;
+  /**
+   * Whether the index was built with `--pdg` (#2086 M6). Gates the `pdg_query`
+   * line in the generated block — without the PDG layer the tool only returns a
+   * "no PDG layer" note, so advertising it on a non-`--pdg` index is noise.
+   */
+  hasPdg?: boolean;
+  /** Whether this index includes opt-in Spring Actuator runtime evidence. */
+  hasSpringActuator?: boolean;
 }
 
 const GITNEXUS_START_MARKER = '<!-- gitnexus:start -->';
 const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
+
+/**
+ * Find the index of a section marker that occupies its own line.
+ * Unlike `indexOf`, this rejects inline prose references like
+ * `` See the `<!-- gitnexus:start -->` block `` that appear
+ * mid-sentence (#1041). A marker counts as section-position only when:
+ *   - preceded by newline or start-of-file, AND
+ *   - followed by newline, `\r` (CRLF files), or end-of-file.
+ * The generator always emits each marker alone on its line, so this
+ * matches every legitimate section and none of the inline mentions.
+ *
+ * `startFrom` lets the end-marker lookup start after the already-found
+ * start marker, avoiding a scan from 0 and guaranteeing we never pick
+ * up an end marker that appears earlier in the file than the start.
+ */
+function findSectionMarkerIndex(content: string, marker: string, startFrom = 0): number {
+  let idx = content.indexOf(marker, startFrom);
+  while (idx !== -1) {
+    const atLineStart = idx === 0 || content[idx - 1] === '\n';
+    const endPos = idx + marker.length;
+    const atLineEnd =
+      endPos === content.length || content[endPos] === '\n' || content[endPos] === '\r';
+    if (atLineStart && atLineEnd) return idx;
+    idx = content.indexOf(marker, idx + 1);
+  }
+  return -1;
+}
 
 /**
  * Generate the full GitNexus context content.
@@ -37,87 +90,196 @@ const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
  * - Exact tool commands with parameters — vague directives get ignored
  * - Self-review checklist — forces model to verify its own work
  */
-function generateGitNexusContent(projectName: string, stats: RepoStats): string {
+async function findGroupsContainingRegistryName(registryName: string): Promise<string[]> {
+  const { listGroups, getDefaultGitnexusDir, getGroupDir } =
+    await import('../core/group/storage.js');
+  const { loadGroupConfig } = await import('../core/group/config-parser.js');
+  const names = await listGroups();
+  const hits: string[] = [];
+  for (const g of names) {
+    try {
+      const config = await loadGroupConfig(getGroupDir(getDefaultGitnexusDir(), g));
+      if (Object.values(config.repos).some((r) => r === registryName)) hits.push(config.name);
+    } catch {
+      // skip invalid or unreadable groups
+    }
+  }
+  return hits;
+}
+
+/**
+ * Strip backticks from a branch name before it is embedded in a Markdown
+ * inline-code span (#1996 tri-review P1). validateBranchName already rejects
+ * backticks for CLI/config/auto-detect inputs; this is the last-line defense at
+ * the generation sink so the embedding is provably safe regardless of caller.
+ */
+export function markdownSafeBranch(branch: string): string {
+  return branch.replace(/`/g, '');
+}
+
+/** Options for {@link generateGitNexusContent} (collapsed from positional
+ *  params, #2188 review — six `undefined`s to reach `hasPdg` was the smell). */
+export interface GitNexusContentOptions {
+  generatedSkills?: GeneratedSkillInfo[];
+  groupNames?: string[];
+  noStats?: boolean;
+  skipSkills?: boolean;
+  /** Project-relative path to the runner `gitnexus analyze` drops next to the
+   *  index (#1945). Referenced by docs so a single CLI-neutral command resolves
+   *  the available runner (global `gitnexus` → `pnpm dlx` → `bunx` → `npx`) at
+   *  call time. */
+  runnerPath?: string;
+  /** Default branch for the regression-compare example (#243). Configurable so
+   *  projects on `develop`/`master`/etc. don't get `base_ref: "main"` rewritten
+   *  back over their fix on every analyze. The value is embedded inside a
+   *  Markdown inline-code span: validateBranchName rejects backticks upstream,
+   *  and `markdownSafeBranch` strips any remaining backtick here as defense in
+   *  depth, so JSON.stringify's quote/escape handling is sufficient and the
+   *  branch cannot break out of the span (#1996 tri-review P1). */
+  defaultBranch?: string;
+  /** Whether the index was built with `--pdg` (#2086 M6). Gates the pdg_query
+   *  line below — false (default) omits it, so a non-pdg index doesn't advertise
+   *  a tool that only returns a "no PDG layer" note. */
+  hasPdg?: boolean;
+  /** Whether Route nodes may carry Spring Actuator runtime evidence. */
+  hasSpringActuator?: boolean;
+}
+
+export function generateGitNexusContent(
+  projectName: string,
+  stats: RepoStats,
+  opts: GitNexusContentOptions = {},
+): string {
+  const {
+    generatedSkills,
+    groupNames,
+    noStats,
+    skipSkills,
+    runnerPath = '.gitnexus/run.cjs',
+    defaultBranch = 'main',
+    hasPdg = false,
+    hasSpringActuator = false,
+  } = opts;
+  const generatedRows =
+    generatedSkills && generatedSkills.length > 0
+      ? generatedSkills
+          .map(
+            (s) =>
+              // The per-cluster count is as volatile as the header parenthetical,
+              // so --no-stats drops it too (#2907) — otherwise the flag that
+              // promises "omit volatile symbol counts" left a churning one behind.
+              `| Work in the ${s.label} area${noStats ? '' : ` (${s.symbolCount} symbols)`} | \`.claude/skills/${s.name}/SKILL.md\` |`,
+          )
+          .join('\n')
+      : '';
+
+  // Standard skill rows reference files installed by installSkills(). When
+  // --skip-skills suppresses that install, these rows must be omitted — else
+  // AGENTS.md/CLAUDE.md would direct agents to read files that don't exist.
+  // Community skills (generatedRows) live directly under .claude/skills/ and
+  // are independent of --skip-skills, so they remain when present.
+  const standardSkillsRows = skipSkills
+    ? ''
+    : STANDARD_SKILL_CATALOG.filter((skill) => skill.distributions.project)
+        .map((skill) => `| ${skill.agentTableTask} | \`.claude/skills/${skill.name}/SKILL.md\` |`)
+        .join('\n');
+
+  const tableBody = [standardSkillsRows, generatedRows].filter(Boolean).join('\n');
+  const skillsTable = tableBody
+    ? `| Task | Read this skill file |
+| --- | --- |
+${tableBody}`
+    : '';
+  // Docs reference the project-local runner `gitnexus analyze` writes (#1945):
+  // a single, CLI-neutral, machine-independent command (no per-machine churn,
+  // #1706) that auto-selects the available runner at call time. Kept terse to
+  // stay under the CLAUDE.md block token budget (#856); the cli skill carries the
+  // full bootstrap + npm-11 fallback (`node.target is null` npx install crash).
+  const runner = `node ${runnerPath}`;
+  // Bootstrap names every install-free one-shot rather than the one this machine
+  // resolves to: the block is committed, so a host-specific command would make
+  // two contributors on different package managers rewrite it at each other on
+  // every analyze (the per-machine churn of #1706). `bunx` is listed because a
+  // bun-only machine has no npm, npx or pnpm at all, and the npx-only note left
+  // it with a bootstrap command it could not run.
+  const bootstrapNote =
+    `No \`${runnerPath}\` yet? Bootstrap with \`npx\`, \`bunx\`, or \`pnpm dlx\` — ` +
+    'e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).';
+
+  // This block is injected into every user's repo and its total size is capped
+  // by test (ai-context.test.ts, #856) — a new bullet or clause has to be paid
+  // for by trimming an existing one.
+  //
+  // The detect_changes bullet carries the degraded-result rule (#2915): a run
+  // that sets `partial` (a graph query failed) or `truncated` (the changed-symbol
+  // listing was capped) is not the pre-commit gate passing, and `partial` pairs
+  // routinely with changed_count:0 — the exact shape that printed "No changes
+  // detected." and exited 0 on a broken analysis. Same reasoning as the
+  // `risk: UNKNOWN` bullet below: the tool could not answer, so its zero is not
+  // an all-clear.
   return `${GITNEXUS_START_MARKER}
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **${projectName}** (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **${projectName}**${noStats ? '' : ` (${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows)`}.
 
-> If any GitNexus tool warns the index is stale, run \`npx gitnexus analyze\` in terminal first.
+> Index stale? Run \`${runner} analyze --index-only\` from the project root — it auto-selects an available runner. ${bootstrapNote}
+> On query/context/impact/cypher object results, read staleness.status and branch/lastCommit. Re-analyze only for behind or diverged — current is clone HEAD, not main.
 
 ## Always Do
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run \`gitnexus_impact({target: "symbolName", direction: "upstream"})\` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run \`gitnexus_detect_changes()\` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use \`gitnexus_query({query: "concept"})\` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use \`gitnexus_context({name: "symbolName"})\`.
-
-## When Debugging
-
-1. \`gitnexus_query({query: "<error or symptom>"})\` — find execution flows related to the issue
-2. \`gitnexus_context({name: "<suspect function>"})\` — see all callers, callees, and process participation
-3. \`READ gitnexus://repo/${projectName}/process/{processName}\` — trace the full execution flow step by step
-4. For regressions: \`gitnexus_detect_changes({scope: "compare", base_ref: "main"})\` — see what your branch changed
-
-## When Refactoring
-
-- **Renaming**: MUST use \`gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})\` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with \`dry_run: false\`.
-- **Extracting/Splitting**: MUST run \`gitnexus_context({name: "target"})\` to see all incoming/outgoing refs, then \`gitnexus_impact({target: "target", direction: "upstream"})\` to find all external callers before moving code.
-- After any refactor: run \`gitnexus_detect_changes({scope: "all"})\` to verify only expected files changed.
+- **MUST run impact before editing.** Use \`impact({target: "symbolName", direction: "upstream"})\` or \`${runner} impact "symbolName" --direction upstream --repo .\`; report callers, processes, and risk. Never substitute grep for graph analysis.${
+    hasPdg
+      ? ` For unified PDG impact, add \`mode: "pdg"\` with optional \`line: <N>\` — it returns statement-level \`affectedStatements\` over CDG + REACHING_DEF and inter-procedural symbols in \`interproceduralByDepth\`/\`byDepth\`; no-layer/degraded PDG results are UNKNOWN-risk notes (\`--pdg\` layer). CLI equivalent: \`${runner} impact "symbolName" --direction upstream --mode pdg --line <N> --repo .\`.`
+      : ''
+  }
+- **MUST analyze graph changes before committing.** Use \`detect_changes({scope: "all"})\` (MCP) or \`${runner} detect-changes --scope all --repo .\` (CLI fallback). \`partial: true\` or \`truncated: true\` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: \`detect_changes({scope: "compare", base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}})\` or \`${runner} detect-changes --scope compare --base-ref ${JSON.stringify(markdownSafeBranch(defaultBranch))} --repo .\`.
+- MUST warn on HIGH/CRITICAL \`risk\` pre-edit; never use \`riskSharedAxes\` to waive a HIGH/CRITICAL \`risk\` warning. Compare File/symbol: MCP File omits axes; Graph-RAG expands File.
+- **MUST treat \`risk: UNKNOWN\` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). \`impact\` pairs \`UNKNOWN\` with a \`riskNote\` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
+- **MUST use \`query({search_query: "concept"})\` for concepts/flows, \`context({name: "symbolName"})\` for a named symbol, or \`impact\` for blast radius, on read-only callers, dependencies, imports, or execution flow.** Graph first; text search only for empty/\`UNKNOWN\`/literals.${
+    hasSpringActuator
+      ? '\n- Spring Actuator runtime evidence is enabled. A Route is authoritative only when `runtimeConfirmed === true`; `runtimeSource` is provenance and may also describe conflicts. Snapshot values are never persisted.'
+      : ''
+  }
+- For security review, \`explain({target: "fileOrSymbol"})\` lists taint findings (source→sink flows; needs \`analyze --pdg\`).${
+    hasPdg
+      ? `\n- For control/data dependence, \`pdg_query({mode: "controls", target: "fileOrSymbol"})\` answers "under what condition does X run?" (CDG, incl. guard clauses) and \`pdg_query({mode: "flows", target, variable})\` traces "where does variable Y flow?" (REACHING_DEF). \`--pdg\` layer.`
+      : ''
+  }
 
 ## Never Do
 
-- NEVER edit a function, class, or method without first running \`gitnexus_impact\` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use \`gitnexus_rename\` which understands the call graph.
-- NEVER commit changes without running \`gitnexus_detect_changes()\` to check affected scope.
-
-## Tools Quick Reference
-
-| Tool | When to use | Command |
-|------|-------------|---------|
-| \`query\` | Find code by concept | \`gitnexus_query({query: "auth validation"})\` |
-| \`context\` | 360-degree view of one symbol | \`gitnexus_context({name: "validateUser"})\` |
-| \`impact\` | Blast radius before editing | \`gitnexus_impact({target: "X", direction: "upstream"})\` |
-| \`detect_changes\` | Pre-commit scope check | \`gitnexus_detect_changes({scope: "staged"})\` |
-| \`rename\` | Safe multi-file rename | \`gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})\` |
-| \`cypher\` | Custom graph queries | \`gitnexus_cypher({query: "MATCH ..."})\` |
-
-## Impact Risk Levels
-
-| Depth | Meaning | Action |
-|-------|---------|--------|
-| d=1 | WILL BREAK — direct callers/importers | MUST update these |
-| d=2 | LIKELY AFFECTED — indirect deps | Should test |
-| d=3 | MAY NEED TESTING — transitive | Test if critical path |
+- NEVER edit a function, class, or method before MCP/CLI impact analysis.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis, and never read \`UNKNOWN\` as an all-clear — it means the walk could not answer, which is the one verdict that requires confirming by other means.
+- NEVER rename symbols with find-and-replace — use \`rename\` which understands the call graph.
+- NEVER commit before MCP/CLI graph change analysis.
 
 ## Resources
 
 | Resource | Use for |
-|----------|---------|
+| --- | --- |
 | \`gitnexus://repo/${projectName}/context\` | Codebase overview, check index freshness |
 | \`gitnexus://repo/${projectName}/clusters\` | All functional areas |
 | \`gitnexus://repo/${projectName}/processes\` | All execution flows |
 | \`gitnexus://repo/${projectName}/process/{name}\` | Step-by-step execution trace |
 
-## Self-Check Before Finishing
+${
+  groupNames && groupNames.length > 0
+    ? `## Cross-Repo Groups
 
-Before completing any code modification task, verify:
-1. \`gitnexus_impact\` was run for all modified symbols
-2. No HIGH/CRITICAL risk warnings were ignored
-3. \`gitnexus_detect_changes()\` confirms changes match expected scope
-4. All d=1 (WILL BREAK) dependents were updated
+This repository is listed under GitNexus **group(s): ${groupNames.join(', ')}** (see \`~/.gitnexus/groups/\`). For cross-repo analysis, use MCP tools \`impact\`, \`query\`, and \`context\` with \`repo\` set to \`@<groupName>\` or \`@<groupName>/<memberPath>\` (paths match keys in that group’s \`group.yaml\`). Use \`group_list\` / \`group_sync\` for membership and sync. From the project root: \`${runner} group list\`, \`${runner} group sync <name>\`, \`${runner} group impact <name> --target <symbol> --repo <group-path>\` (the \`${runnerPath}\` path is repo-root-relative).
 
-## CLI
+`
+    : ''
+}${
+    skillsTable
+      ? `## CLI
 
-- Re-index: \`npx gitnexus analyze\`
-- Check freshness: \`npx gitnexus status\`
-- Generate docs: \`npx gitnexus wiki\`
+${skillsTable}
 
-${GITNEXUS_END_MARKER}`;
+`
+      : ''
+  }${GITNEXUS_END_MARKER}`;
 }
-
 
 /**
  * Check if a file exists
@@ -132,30 +294,128 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Replace the block's volatile counts — the header parenthetical and the
+ * per-cluster symbol counts in the skills table — with fixed placeholders, so
+ * two renderings that differ only in those numbers compare equal.
+ *
+ * Placeholders rather than deletions: `--no-stats` REMOVES the parenthetical,
+ * which must still be written through. Deleting instead of substituting would
+ * make a with-counts block and a without-counts block compare equal, and the
+ * flag would silently stop taking effect on an already-injected file.
+ */
+function stripVolatileCounts(section: string): string {
+  return section
+    .replace(/ \(\d+ symbols, \d+ relationships, \d+ execution flows\)/g, ' (<counts>)')
+    .replace(/ \(\d+ symbols\)/g, ' (<count>)');
+}
+
+/**
  * Create or update GitNexus section in a file
  * - If file doesn't exist: create with GitNexus content
  * - If file exists without GitNexus section: append
- * - If file exists with GitNexus section: replace that section
+ * - If file exists with GitNexus section: replace that section, UNLESS the only
+ *   delta is the volatile counts (#2907). AGENTS.md and CLAUDE.md are the agent
+ *   guides teams commit, and the counts move with any code change, so a
+ *   count-only rewrite dirties a tracked file on every reindex for no reader
+ *   benefit. Live counts stay available from `gitnexus status` and
+ *   `gitnexus://repo/{name}/context`; the committed block keeps whichever
+ *   numbers it was last materially updated with.
  */
 async function upsertGitNexusSection(
   filePath: string,
-  content: string
-): Promise<'created' | 'updated' | 'appended'> {
+  content: string,
+  projectName: string,
+  stats: RepoStats,
+  noStats?: boolean,
+): Promise<'created' | 'updated' | 'appended' | 'preserved'> {
   const exists = await fileExists(filePath);
 
   if (!exists) {
-    await fs.writeFile(filePath, content, 'utf-8');
+    // Same `.trim() + '\n'` shape the update paths write. Creating without the
+    // trailing newline made the NEXT analyze dirty a freshly committed file
+    // even at unchanged counts, purely to append it (#2907).
+    await fs.writeFile(filePath, content.trim() + '\n', 'utf-8');
     return 'created';
   }
 
   const existingContent = await fs.readFile(filePath, 'utf-8');
 
-  // Check if GitNexus section already exists
-  const startIdx = existingContent.indexOf(GITNEXUS_START_MARKER);
-  const endIdx = existingContent.indexOf(GITNEXUS_END_MARKER);
+  // Check if GitNexus section already exists. Matching is restricted
+  // to markers that occupy their own line so that inline prose
+  // references (e.g. `` See the `<!-- gitnexus:start -->` block `` in
+  // the shipped CLAUDE.md) are NOT treated as section delimiters
+  // (#1041). The end-marker scan starts after the start-marker so it
+  // can never pick up an earlier end in the file.
+  const startIdx = findSectionMarkerIndex(existingContent, GITNEXUS_START_MARKER);
+  const endIdx = findSectionMarkerIndex(
+    existingContent,
+    GITNEXUS_END_MARKER,
+    startIdx === -1 ? 0 : startIdx,
+  );
 
   if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-    // Replace existing section
+    const existingSection = existingContent.substring(
+      startIdx,
+      endIdx + GITNEXUS_END_MARKER.length,
+    );
+
+    // If the existing section contains <!-- gitnexus:keep -->, preserve the user's
+    // custom layout and only update the stats line (node/edge/flow counts).
+    // This lets teams trim the verbose default template to a lean format without
+    // having it overwritten on every `gitnexus analyze`.
+    //
+    // Note: the keep-marker check operates on `existingSection` (the substring
+    // between valid section markers identified by findSectionMarkerIndex), so
+    // a keep marker in user prose OUTSIDE the GitNexus block has no effect.
+    if (existingSection.includes('<!-- gitnexus:keep -->')) {
+      // Build the new stats line from the caller-provided values directly.
+      // We do NOT re-extract from `content` because:
+      //   (a) first-bold extraction is fragile if the template evolves
+      //   (b) the parenthesized-text fallback can match unrelated tuples
+      //       like `({target: "symbolName", direction: "upstream"})`
+      //       when noStats is set
+      // Passing projectName + stats explicitly makes the contract obvious.
+      // --no-stats wins in the keep path too (#1706): a lean block committed
+      // to git would otherwise churn the volatile counts on every analyze,
+      // producing no-value merge conflicts between branches. Under noStats we
+      // drop the parenthetical but still refresh the project name so renames
+      // propagate.
+      const newStatsInner = `${stats.nodes || 0} symbols, ${stats.edges || 0} relationships, ${stats.processes || 0} execution flows`;
+      const statsLine = noStats
+        ? `Indexed as **${projectName}**`
+        : `Indexed as **${projectName}** (${newStatsInner})`;
+
+      // Match either canonical phrasing at line start (`^` with `m` flag) so we
+      // cannot replace prose embedded mid-paragraph. Deliberately no `$`: text
+      // after the line on the same line (e.g. ". MCP tools.") stays intact.
+      // The parenthetical is optional so a count-free line left by a prior
+      // --no-stats run still matches — letting the name refresh, and letting
+      // counts return if --no-stats is later dropped.
+      const statsPattern = /^(?:Indexed as|indexed by GitNexus as) \*\*[^*]+\*\*(?: \([^)]+\))?/m;
+
+      if (statsPattern.test(existingSection)) {
+        const updatedSection = existingSection.replace(statsPattern, statsLine);
+        // Count-only delta — leave the committed lean block alone (#2907). A
+        // project rename, or --no-stats dropping the parenthetical, still writes.
+        if (stripVolatileCounts(updatedSection) === stripVolatileCounts(existingSection)) {
+          return 'preserved';
+        }
+        const before = existingContent.substring(0, startIdx);
+        const after = existingContent.substring(endIdx + GITNEXUS_END_MARKER.length);
+        await fs.writeFile(filePath, (before + updatedSection + after).trim() + '\n', 'utf-8');
+        return 'updated';
+      }
+      // Keep marker present but no stats line matched. Section is preserved
+      // unchanged on disk; return a distinct status so callers/CLI output
+      // don't mis-report this as 'updated' (which would imply a write).
+      return 'preserved';
+    }
+
+    // No keep marker — replace existing section with full verbose content,
+    // unless the counts are the only thing that moved (#2907).
+    if (stripVolatileCounts(existingSection) === stripVolatileCounts(content)) {
+      return 'preserved';
+    }
     const before = existingContent.substring(0, startIdx);
     const after = existingContent.substring(endIdx + GITNEXUS_END_MARKER.length);
     const newContent = before + content + after;
@@ -170,49 +430,107 @@ async function upsertGitNexusSection(
 }
 
 /**
- * Install GitNexus skills to .claude/skills/gitnexus/
- * Works natively with Claude Code, Cursor, and GitHub Copilot
+ * Some agents read skills from a repo-local `.agents/skills/` directory and
+ * prefer it over the global `~/.agents/skills/` install. When the repo contains
+ * an `.agents/` directory, skills written to `.claude/skills/` are mirrored
+ * there too so those agents serve the up-to-date copies.
  */
-async function installSkills(repoPath: string): Promise<string[]> {
-  const skillsDir = path.join(repoPath, '.claude', 'skills', 'gitnexus');
+export async function shouldMirrorSkillsToAgents(repoPath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(path.join(repoPath, '.agents'));
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+const SKILL_PRESERVE_HINT =
+  'delete the file to refresh from the bundled template, or pass --skip-skills to skip skill install';
+
+async function readUtf8IfPresent(filePath: string): Promise<string | null> {
+  try {
+    return await fs.readFile(filePath, 'utf-8');
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+}
+
+function skillBytesDiverge(existing: string | null, bundled: string): boolean {
+  return existing !== null && existing !== bundled;
+}
+
+/** Write bundled skill bytes unless an existing file already differs. */
+async function writeSkillUnlessDivergent(filePath: string, content: string): Promise<boolean> {
+  const existing = await readUtf8IfPresent(filePath);
+  if (skillBytesDiverge(existing, content)) {
+    logger.warn(`Preserved customized skill ${filePath}; ${SKILL_PRESERVE_HINT}.`);
+    return true;
+  }
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, content, 'utf-8');
+  return false;
+}
+
+async function inspectLegacySkillDir(
+  legacyDir: string,
+): Promise<{ nestedExisting: string | null; hasSiblings: boolean } | null> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(legacyDir);
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+  const nestedExisting = entries.includes('SKILL.md')
+    ? await fs.readFile(path.join(legacyDir, 'SKILL.md'), 'utf-8')
+    : null;
+  return {
+    nestedExisting,
+    hasSiblings: entries.some((entry) => entry !== 'SKILL.md'),
+  };
+}
+
+function formatSkillInstallLine(
+  prefix: string,
+  total: number,
+  preserved: number,
+  allWrittenSuffix: string,
+  partialSuffix: string,
+): string {
+  if (preserved > 0) {
+    return `${prefix} (${total - preserved} written, ${preserved} ${partialSuffix})`;
+  }
+  return `${prefix} (${total} ${allWrittenSuffix})`;
+}
+
+/**
+ * Install GitNexus skills as direct children of .claude/skills/
+ * Works natively with Claude Code, Cursor, and GitHub Copilot.
+ * Mirrored to .agents/skills/ when .agents/ exists.
+ */
+async function installSkills(repoPath: string): Promise<{
+  skills: string[];
+  agentsMirror: boolean;
+  claudePreserved: number;
+  agentsPreserved: number;
+  legacyPreserved: number;
+}> {
+  const skillsDir = path.join(repoPath, '.claude', 'skills');
+  const legacySkillsDir = path.join(skillsDir, 'gitnexus');
   const installedSkills: string[] = [];
+  let claudePreserved = 0;
+  let agentsPreserved = 0;
+  let legacyPreserved = 0;
+  const agentsMirror = await shouldMirrorSkillsToAgents(repoPath);
 
-  // Skill definitions bundled with the package
-  const skills = [
-    {
-      name: 'gitnexus-exploring',
-      description: 'Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: "How does X work?", "What calls this function?", "Show me the auth flow"',
-    },
-    {
-      name: 'gitnexus-debugging',
-      description: 'Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: "Why is X failing?", "Where does this error come from?", "Trace this bug"',
-    },
-    {
-      name: 'gitnexus-impact-analysis',
-      description: 'Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"',
-    },
-    {
-      name: 'gitnexus-refactoring',
-      description: 'Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: "Rename this function", "Extract this into a module", "Refactor this class", "Move this to a separate file"',
-    },
-    {
-      name: 'gitnexus-guide',
-      description: 'Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: "What GitNexus tools are available?", "How do I use GitNexus?"',
-    },
-    {
-      name: 'gitnexus-cli',
-      description: 'Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: "Index this repo", "Reanalyze the codebase", "Generate a wiki"',
-    },
-  ];
-
-  for (const skill of skills) {
+  for (const skill of STANDARD_SKILL_CATALOG.filter(
+    (entry) => entry.distributions.project && entry.distributions.npm,
+  )) {
     const skillDir = path.join(skillsDir, skill.name);
     const skillPath = path.join(skillDir, 'SKILL.md');
 
     try {
-      // Create skill directory
-      await fs.mkdir(skillDir, { recursive: true });
-
       // Try to read from package skills directory
       const packageSkillPath = path.join(__dirname, '..', '..', 'skills', `${skill.name}.md`);
       let skillContent: string;
@@ -223,26 +541,65 @@ async function installSkills(repoPath: string): Promise<string[]> {
         // Fallback: generate minimal skill content
         skillContent = `---
 name: ${skill.name}
-description: ${skill.description}
+description: ${skill.fallbackDescription}
 ---
 
 # ${skill.name.charAt(0).toUpperCase() + skill.name.slice(1)}
 
-${skill.description}
+${skill.fallbackDescription}
 
 Use GitNexus tools to accomplish this task.
 `;
       }
 
-      await fs.writeFile(skillPath, skillContent, 'utf-8');
+      if (await writeSkillUnlessDivergent(skillPath, skillContent)) claudePreserved += 1;
+
+      // Mirror to .agents/skills/ for agents that read repo-local skills
+      if (agentsMirror) {
+        try {
+          const agentsSkillPath = path.join(repoPath, '.agents', 'skills', skill.name, 'SKILL.md');
+          if (await writeSkillUnlessDivergent(agentsSkillPath, skillContent)) agentsPreserved += 1;
+        } catch (err) {
+          logger.warn({ err }, `Warning: Could not mirror skill ${skill.name} to .agents/skills:`);
+        }
+      }
+
       installedSkills.push(skill.name);
+
+      // Previous releases installed these known standard skills one level too
+      // deep. Remove only the child owned by this installer; unknown siblings
+      // under the legacy grouping directory may be user-authored and survive.
+      try {
+        const legacyDir = path.join(legacySkillsDir, skill.name);
+        const nestedSkill = path.join(legacyDir, 'SKILL.md');
+        const leftover = await inspectLegacySkillDir(legacyDir);
+        if (leftover !== null && skillBytesDiverge(leftover.nestedExisting, skillContent)) {
+          logger.warn(`Preserved customized skill ${nestedSkill}; ${SKILL_PRESERVE_HINT}.`);
+          legacyPreserved += 1;
+        } else if (leftover?.hasSiblings) {
+          logger.warn(
+            `Preserved legacy skill directory ${legacyDir} because it contains operator-owned files.`,
+          );
+          legacyPreserved += 1;
+        } else if (leftover !== null) {
+          await fs.rm(legacyDir, { recursive: true, force: true });
+        }
+      } catch (err) {
+        logger.warn({ err }, `Warning: Could not remove legacy skill ${skill.name}:`);
+      }
     } catch (err) {
       // Skip on error, don't fail the whole process
-      console.warn(`Warning: Could not install skill ${skill.name}:`, err);
+      logger.warn({ err }, `Warning: Could not install skill ${skill.name}:`);
     }
   }
 
-  return installedSkills;
+  return {
+    skills: installedSkills,
+    agentsMirror,
+    claudePreserved,
+    agentsPreserved,
+    legacyPreserved,
+  };
 }
 
 /**
@@ -250,29 +607,173 @@ Use GitNexus tools to accomplish this task.
  */
 export async function generateAIContextFiles(
   repoPath: string,
-  _storagePath: string,
+  storagePath: string,
   projectName: string,
-  stats: RepoStats
+  stats: RepoStats,
+  generatedSkills?: GeneratedSkillInfo[],
+  options?: AIContextOptions,
 ): Promise<{ files: string[] }> {
-  const content = generateGitNexusContent(projectName, stats);
+  const groupNames = await findGroupsContainingRegistryName(projectName);
+
+  // Drop a project-local runner next to the index (#1945) so the generated docs
+  // can reference one CLI-neutral command that resolves the available runner at
+  // call time. It is a copy of the canonical self-contained resolver, which the
+  // CLI and hooks already share; failure to copy is non-fatal (docs carry a
+  // bootstrap fallback). `runnerPath` is project-relative with POSIX separators
+  // so the emitted command is identical across platforms.
+  // A shared-store slot (#3352) lives under the GitNexus home, so its path
+  // would be machine- and worktree-specific in committed docs; the runner goes
+  // next to the checkout's store pointer instead.
+  const runnerDir = storeRootOfCheckoutSlot(storagePath)
+    ? path.join(repoPath, GITNEXUS_DIR)
+    : storagePath;
+  const runnerPath = path.relative(repoPath, path.join(runnerDir, 'run.cjs')).replace(/\\/g, '/');
+  try {
+    const runnerSrc = path.join(
+      __dirname,
+      '..',
+      '..',
+      'hooks',
+      'claude',
+      'resolve-analyze-cmd.cjs',
+    );
+    await fs.mkdir(runnerDir, { recursive: true });
+    await fs.copyFile(runnerSrc, path.join(runnerDir, 'run.cjs'));
+  } catch (err) {
+    logger.warn(`Could not write GitNexus runner to ${runnerPath}: ${String(err)}`);
+  }
+
+  const content = generateGitNexusContent(projectName, stats, {
+    generatedSkills,
+    groupNames,
+    noStats: options?.noStats,
+    skipSkills: options?.skipSkills,
+    runnerPath,
+    defaultBranch: options?.defaultBranch ?? 'main',
+    hasPdg: options?.hasPdg ?? false,
+    hasSpringActuator: options?.hasSpringActuator ?? false,
+  });
   const createdFiles: string[] = [];
 
-  // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
-  const agentsPath = path.join(repoPath, 'AGENTS.md');
-  const agentsResult = await upsertGitNexusSection(agentsPath, content);
-  createdFiles.push(`AGENTS.md (${agentsResult})`);
+  if (!options?.skipAgentsMd) {
+    // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
+    const agentsPath = path.join(repoPath, 'AGENTS.md');
+    const agentsResult = await upsertGitNexusSection(
+      agentsPath,
+      content,
+      projectName,
+      stats,
+      options?.noStats,
+    );
+    createdFiles.push(`AGENTS.md (${agentsResult})`);
 
-  // Create CLAUDE.md (for Claude Code)
-  const claudePath = path.join(repoPath, 'CLAUDE.md');
-  const claudeResult = await upsertGitNexusSection(claudePath, content);
-  createdFiles.push(`CLAUDE.md (${claudeResult})`);
+    // Create CLAUDE.md (for Claude Code)
+    const claudePath = path.join(repoPath, 'CLAUDE.md');
+    const claudeResult = await upsertGitNexusSection(
+      claudePath,
+      content,
+      projectName,
+      stats,
+      options?.noStats,
+    );
+    createdFiles.push(`CLAUDE.md (${claudeResult})`);
+  } else {
+    createdFiles.push('AGENTS.md (skipped via --skip-agents-md)');
+    createdFiles.push('CLAUDE.md (skipped via --skip-agents-md)');
+  }
 
-  // Install skills to .claude/skills/gitnexus/
-  const installedSkills = await installSkills(repoPath);
-  if (installedSkills.length > 0) {
-    createdFiles.push(`.claude/skills/gitnexus/ (${installedSkills.length} skills)`);
+  // Install standard skills directly under .claude/skills/ (unless --skip-skills)
+  if (!options?.skipSkills) {
+    const {
+      skills: installedSkills,
+      agentsMirror,
+      claudePreserved,
+      agentsPreserved,
+      legacyPreserved,
+    } = await installSkills(repoPath);
+    if (installedSkills.length > 0) {
+      createdFiles.push(
+        formatSkillInstallLine(
+          '.claude/skills/gitnexus-*/',
+          installedSkills.length,
+          claudePreserved,
+          'skills',
+          'preserved',
+        ),
+      );
+      if (agentsMirror) {
+        createdFiles.push(
+          formatSkillInstallLine(
+            '.agents/skills/gitnexus-*/',
+            installedSkills.length,
+            agentsPreserved,
+            'skills mirrored for .agents',
+            'preserved for .agents',
+          ),
+        );
+      }
+      if (legacyPreserved > 0) {
+        createdFiles.push(
+          `.claude/skills/gitnexus/<name>/ (legacy directories preserved: ${legacyPreserved})`,
+        );
+      }
+    }
+  } else {
+    createdFiles.push('.claude/skills/gitnexus-*/ (skipped via --skip-skills)');
   }
 
   return { files: createdFiles };
 }
 
+/**
+ * Refresh only the `base_ref: "..."` value inside the GitNexus block of an
+ * already-generated AGENTS.md / CLAUDE.md, in place (#1996 tri-review P2).
+ *
+ * The `alreadyUpToDate` analyze fast path returns before the normal
+ * {@link generateAIContextFiles} call, so a changed `.gitnexusrc` defaultBranch
+ * (or `--default-branch`) would otherwise not take effect until the next
+ * re-index. This does a surgical line update that preserves the rest of the
+ * block — including community-skill rows written by a prior `--skills` run —
+ * rather than regenerating (which would drop those rows on a no-`--skills` run).
+ *
+ * Best-effort: missing files, a missing/blank block, or a block with no
+ * `base_ref` line (e.g. a user-trimmed keep block) are silently skipped. Writes
+ * only when the value actually changes, so a routine up-to-date run is a no-op.
+ */
+export async function refreshBaseRefLine(
+  repoPath: string,
+  defaultBranch: string,
+  options?: { skipAgentsMd?: boolean },
+): Promise<{ files: string[] }> {
+  if (options?.skipAgentsMd) return { files: [] };
+  const replacement = `base_ref: ${JSON.stringify(markdownSafeBranch(defaultBranch))}`;
+  const updated: string[] = [];
+  for (const name of ['AGENTS.md', 'CLAUDE.md']) {
+    const filePath = path.join(repoPath, name);
+    if (!(await fileExists(filePath))) continue;
+    let content: string;
+    try {
+      content = await fs.readFile(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+    const startIdx = findSectionMarkerIndex(content, GITNEXUS_START_MARKER);
+    if (startIdx === -1) continue;
+    const endIdx = findSectionMarkerIndex(content, GITNEXUS_END_MARKER, startIdx);
+    if (endIdx === -1 || endIdx <= startIdx) continue;
+    const blockEnd = endIdx + GITNEXUS_END_MARKER.length;
+    const block = content.substring(startIdx, blockEnd);
+    // Only the generated regression example carries a base_ref line, and only
+    // one per block; replace its quoted value while leaving the rest untouched.
+    const newBlock = block.replace(/base_ref: "(?:[^"\\]|\\.)*"/, replacement);
+    if (newBlock === block) continue; // no base_ref line present, or already current
+    const newContent = content.substring(0, startIdx) + newBlock + content.substring(blockEnd);
+    try {
+      await fs.writeFile(filePath, newContent, 'utf-8');
+      updated.push(name);
+    } catch {
+      // best-effort — never fail analyze over a context refresh
+    }
+  }
+  return { files: updated };
+}

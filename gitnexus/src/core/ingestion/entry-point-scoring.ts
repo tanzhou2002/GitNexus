@@ -1,149 +1,50 @@
 /**
  * Entry Point Scoring
- * 
+ *
  * Calculates entry point scores for process detection based on:
  * 1. Call ratio (existing algorithm - callees / (callers + 1))
  * 2. Export status (exported functions get higher priority)
  * 3. Name patterns (functions matching entry point patterns like handle*, on*, *Controller)
  * 4. Framework detection (path-based detection for Next.js, Express, Django, etc.)
- * 
+ *
  * This module is language-agnostic - language-specific patterns are defined per language.
  */
 
 import { detectFrameworkFromPath } from './framework-detection.js';
+import { SupportedLanguages } from 'gitnexus-shared';
+import { providers } from './languages/index.js';
+import { isTestFilePath } from './utils/test-file-path.js';
 
 // ============================================================================
-// NAME PATTERNS - All 9 supported languages
+// NAME PATTERNS
 // ============================================================================
 
 /**
- * Common entry point naming patterns by language
- * These patterns indicate functions that are likely feature entry points
+ * Universal entry point naming patterns shared across all languages.
+ * Per-language patterns live on each LanguageProvider.entryPointPatterns.
  */
-const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
-  // Universal patterns (apply to all languages)
-  '*': [
-    /^(main|init|bootstrap|start|run|setup|configure)$/i,
-    /^handle[A-Z]/,           // handleLogin, handleSubmit
-    /^on[A-Z]/,               // onClick, onSubmit
-    /Handler$/,               // RequestHandler
-    /Controller$/,            // UserController
-    /^process[A-Z]/,          // processPayment
-    /^execute[A-Z]/,          // executeQuery
-    /^perform[A-Z]/,          // performAction
-    /^dispatch[A-Z]/,         // dispatchEvent
-    /^trigger[A-Z]/,          // triggerAction
-    /^fire[A-Z]/,             // fireEvent
-    /^emit[A-Z]/,             // emitEvent
-  ],
-  
-  // JavaScript/TypeScript
-  'javascript': [
-    /^use[A-Z]/,              // React hooks (useEffect, etc.)
-  ],
-  'typescript': [
-    /^use[A-Z]/,              // React hooks
-  ],
-  
-  // Python
-  'python': [
-    /^app$/,                  // Flask/FastAPI app
-    /^(get|post|put|delete|patch)_/i,  // REST conventions
-    /^api_/,                  // API functions
-    /^view_/,                 // Django views
-  ],
-  
-  // Java
-  'java': [
-    /^do[A-Z]/,               // doGet, doPost (Servlets)
-    /^create[A-Z]/,           // Factory patterns
-    /^build[A-Z]/,            // Builder patterns
-    /Service$/,               // UserService
-  ],
-  
-  // C#
-  'csharp': [
-    /^(Get|Post|Put|Delete)/,  // ASP.NET conventions
-    /Action$/,                 // MVC actions
-    /^On[A-Z]/,               // Event handlers
-    /Async$/,                 // Async entry points
-  ],
-  
-  // Go
-  'go': [
-    /Handler$/,               // http.Handler pattern
-    /^Serve/,                 // ServeHTTP
-    /^New[A-Z]/,              // Constructor pattern (returns new instance)
-    /^Make[A-Z]/,             // Make functions
-  ],
-  
-  // Rust
-  'rust': [
-    /^(get|post|put|delete)_handler$/i,
-    /^handle_/,               // handle_request
-    /^new$/,                  // Constructor pattern
-    /^run$/,                  // run entry point
-    /^spawn/,                 // Async spawn
-  ],
-  
-  // C - explicit main() boost (critical for C programs)
-  'c': [
-    /^main$/,                 // THE entry point
-    /^init_/,                 // Initialization functions
-    /^start_/,                // Start functions
-    /^run_/,                  // Run functions
-  ],
-  
-  // C++ - same as C plus class patterns
-  'cpp': [
-    /^main$/,                 // THE entry point
-    /^init_/,
-    /^Create[A-Z]/,           // Factory patterns
-    /^Run$/,                  // Run methods
-    /^Start$/,                // Start methods
-  ],
+const UNIVERSAL_ENTRY_POINT_PATTERNS: RegExp[] = [
+  /^(main|init|bootstrap|start|run|setup|configure)$/i,
+  /^handle[A-Z]/, // handleLogin, handleSubmit
+  /^on[A-Z]/, // onClick, onSubmit
+  /Handler$/, // RequestHandler
+  /Controller$/, // UserController
+  /^process[A-Z]/, // processPayment
+  /^execute[A-Z]/, // executeQuery
+  /^perform[A-Z]/, // performAction
+  /^dispatch[A-Z]/, // dispatchEvent
+  /^trigger[A-Z]/, // triggerAction
+  /^fire[A-Z]/, // fireEvent
+  /^emit[A-Z]/, // emitEvent
+];
 
-  // Swift / iOS
-  'swift': [
-    /^viewDidLoad$/,                  // UIKit lifecycle
-    /^viewWillAppear$/,               // UIKit lifecycle
-    /^viewDidAppear$/,                // UIKit lifecycle
-    /^viewWillDisappear$/,            // UIKit lifecycle
-    /^viewDidDisappear$/,             // UIKit lifecycle
-    /^application\(/,                 // AppDelegate methods
-    /^scene\(/,                       // SceneDelegate methods
-    /^body$/,                         // SwiftUI View.body
-    /Coordinator$/,                   // Coordinator pattern
-    /^sceneDidBecomeActive$/,         // SceneDelegate lifecycle
-    /^sceneWillResignActive$/,        // SceneDelegate lifecycle
-    /^didFinishLaunchingWithOptions$/, // AppDelegate
-    /ViewController$/,                // ViewController classes
-    /^configure[A-Z]/,               // Configuration methods
-    /^setup[A-Z]/,                    // Setup methods
-    /^makeBody$/,                     // SwiftUI ViewModifier
-  ],
-
-  // PHP / Laravel
-  'php': [
-    /Controller$/,            // UserController (class name convention)
-    /^handle$/,               // Job::handle(), Listener::handle()
-    /^execute$/,              // Command::execute()
-    /^boot$/,                 // ServiceProvider::boot()
-    /^register$/,             // ServiceProvider::register()
-    /^__invoke$/,             // Invokable controllers/actions
-    /^(index|show|store|update|destroy|create|edit)$/,  // RESTful resource methods
-    /^(get|post|put|delete|patch)[A-Z]/,  // Explicit HTTP method actions
-    /^run$/,                  // Command/Job run()
-    /^fire$/,                 // Event fire()
-    /^dispatch$/,             // Dispatchable jobs
-    /Service$/,               // UserService (Service layer)
-    /Repository$/,            // UserRepository (Repository pattern)
-    /^find$/,                 // Repository::find()
-    /^findAll$/,              // Repository::findAll()
-    /^save$/,                 // Repository::save()
-    /^delete$/,               // Repository::delete()
-  ],
-};
+/** Pre-computed merged patterns (universal + language-specific) from providers. */
+const MERGED_ENTRY_POINT_PATTERNS = Object.fromEntries(
+  Object.entries(providers).map(([lang, provider]) => [
+    lang,
+    [...UNIVERSAL_ENTRY_POINT_PATTERNS, ...(provider.entryPointPatterns ?? [])],
+  ]),
+) as Record<SupportedLanguages, RegExp[]>;
 
 // ============================================================================
 // UTILITY PATTERNS - Functions that should be penalized
@@ -154,16 +55,16 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
  * These get penalized in scoring
  */
 const UTILITY_PATTERNS: RegExp[] = [
-  /^(get|set|is|has|can|should|will|did)[A-Z]/,  // Accessors/predicates
-  /^_/,                                            // Private by convention
-  /^(format|parse|validate|convert|transform)/i,  // Transformation utilities
-  /^(log|debug|error|warn|info)$/i,               // Logging
-  /^(to|from)[A-Z]/,                              // Conversions
-  /^(encode|decode)/i,                            // Encoding utilities
-  /^(serialize|deserialize)/i,                    // Serialization
-  /^(clone|copy|deep)/i,                          // Cloning utilities
-  /^(merge|extend|assign)/i,                      // Object utilities
-  /^(filter|map|reduce|sort|find)/i,             // Collection utilities (standalone)
+  /^(get|set|is|has|can|should|will|did)[A-Z]/, // Accessors/predicates
+  /^_/, // Private by convention
+  /^(format|parse|validate|convert|transform)/i, // Transformation utilities
+  /^(log|debug|error|warn|info)$/i, // Logging
+  /^(to|from)[A-Z]/, // Conversions
+  /^(encode|decode)/i, // Encoding utilities
+  /^(serialize|deserialize)/i, // Serialization
+  /^(clone|copy|deep)/i, // Cloning utilities
+  /^(merge|extend|assign)/i, // Object utilities
+  /^(filter|map|reduce|sort|find)/i, // Collection utilities (standalone)
   /Helper$/,
   /Util$/,
   /Utils$/,
@@ -186,10 +87,10 @@ export interface EntryPointScoreResult {
 
 /**
  * Calculate an entry point score for a function/method
- * 
+ *
  * Higher scores indicate better entry point candidates.
  * Score = baseScore × exportMultiplier × nameMultiplier
- * 
+ *
  * @param name - Function/method name
  * @param language - Programming language
  * @param isExported - Whether the function is exported/public
@@ -199,62 +100,74 @@ export interface EntryPointScoreResult {
  */
 export function calculateEntryPointScore(
   name: string,
-  language: string,
+  language: SupportedLanguages,
   isExported: boolean,
   callerCount: number,
   calleeCount: number,
-  filePath: string = ''  // Optional for backwards compatibility
+  filePath: string = '', // Optional for backwards compatibility
 ): EntryPointScoreResult {
   const reasons: string[] = [];
-  
+
   // Must have outgoing calls to be an entry point (we need to trace forward)
   if (calleeCount === 0) {
     return { score: 0, reasons: ['no-outgoing-calls'] };
   }
-  
+
   // Base score: call ratio (existing algorithm)
   // High ratio = calls many, called by few = likely entry point
   const baseScore = calleeCount / (callerCount + 1);
   reasons.push(`base:${baseScore.toFixed(2)}`);
-  
+
   // Export bonus: exported/public functions are more likely entry points
   const exportMultiplier = isExported ? 2.0 : 1.0;
   if (isExported) {
     reasons.push('exported');
   }
-  
+
   // Name pattern scoring
   let nameMultiplier = 1.0;
-  
+
+  // tRPC procedures often use accessor-style names
+  // (`getX`, `setX`, `isX`) that legitimately ARE entry points. Without this
+  // exemption, the 0.3× utility penalty cancels the 3.0× tRPC framework boost
+  // (net 0.9, below baseline), preventing procedures like `setSettings`
+  // from becoming Process entry points and hiding them from `query` results.
+  // Only accessor/predicate names skip the penalty — helpers such as
+  // `formatDate`, `_internal`, or `parseInput` in the same router file still
+  // match UTILITY_PATTERNS. The 3.0× tRPC framework boost stays path-based.
+  // The exemption follows detectFrameworkFromPath so T3 (`/api/routers/`) and
+  // `/app/trpc/routers/` layouts get the same treatment as `/trpc/routers/`.
+  // Optional chaining still guards paths that fail the tRPC predicates
+  // (e.g. generic `/routers/*.js` without `/trpc/` or `/api/routers/`).
+  // JS/JSX routers that match those predicates get `framework: 'trpc'`
+  // the same way TS/TSX routers do.
+  const frameworkHint = filePath ? detectFrameworkFromPath(filePath) : null;
+  const trpcAccessorExemption =
+    frameworkHint?.framework === 'trpc' && /^(get|set|is|has|can|should|will|did)[A-Z]/.test(name);
+
   // Check negative patterns first (utilities get penalized)
-  if (UTILITY_PATTERNS.some(p => p.test(name))) {
-    nameMultiplier = 0.3;  // Significant penalty
+  if (!trpcAccessorExemption && UTILITY_PATTERNS.some((p) => p.test(name))) {
+    nameMultiplier = 0.3; // Significant penalty
     reasons.push('utility-pattern');
   } else {
     // Check positive patterns
-    const universalPatterns = ENTRY_POINT_PATTERNS['*'] || [];
-    const langPatterns = ENTRY_POINT_PATTERNS[language] || [];
-    const allPatterns = [...universalPatterns, ...langPatterns];
-    
-    if (allPatterns.some(p => p.test(name))) {
-      nameMultiplier = 1.5;  // Bonus for matching entry point pattern
+    const allPatterns = MERGED_ENTRY_POINT_PATTERNS[language];
+
+    if (allPatterns?.some((p) => p.test(name))) {
+      nameMultiplier = 1.5; // Bonus for matching entry point pattern
       reasons.push('entry-pattern');
     }
   }
-  
-  // Framework detection bonus (Phase 2)
+
   let frameworkMultiplier = 1.0;
-  if (filePath) {
-    const frameworkHint = detectFrameworkFromPath(filePath);
-    if (frameworkHint) {
-      frameworkMultiplier = frameworkHint.entryPointMultiplier;
-      reasons.push(`framework:${frameworkHint.reason}`);
-    }
+  if (frameworkHint) {
+    frameworkMultiplier = frameworkHint.entryPointMultiplier;
+    reasons.push(`framework:${frameworkHint.reason}`);
   }
-  
+
   // Calculate final score
   const finalScore = baseScore * exportMultiplier * nameMultiplier * frameworkMultiplier;
-  
+
   return {
     score: finalScore,
     reasons,
@@ -266,44 +179,15 @@ export function calculateEntryPointScore(
 // ============================================================================
 
 /**
- * Check if a file path is a test file (should be excluded from entry points)
- * Covers common test file patterns across all supported languages
+ * Check if a file path is a test file (should be excluded from entry points).
+ *
+ * Delegates to the shared predicate in `utils/test-file-path.ts`. This used to be
+ * a second, hand-maintained copy that had drifted from the one backing the MCP
+ * `includeTests` flag — see that module's header. Re-exported under this name so
+ * existing importers are unaffected.
  */
 export function isTestFile(filePath: string): boolean {
-  const p = filePath.toLowerCase().replace(/\\/g, '/');
-  
-  return (
-    // JavaScript/TypeScript test patterns
-    p.includes('.test.') || 
-    p.includes('.spec.') || 
-    p.includes('__tests__/') || 
-    p.includes('__mocks__/') ||
-    // Generic test folders
-    p.includes('/test/') ||
-    p.includes('/tests/') ||
-    p.includes('/testing/') ||
-    // Python test patterns
-    p.endsWith('_test.py') ||
-    p.includes('/test_') ||
-    // Go test patterns
-    p.endsWith('_test.go') ||
-    // Java test patterns
-    p.includes('/src/test/') ||
-    // Rust test patterns (inline tests are different, but test files)
-    p.includes('/tests/') ||
-    // Swift/iOS test patterns
-    p.endsWith('tests.swift') ||
-    p.endsWith('test.swift') ||
-    p.includes('uitests/') ||
-    // C# test patterns
-    p.includes('.tests/') ||
-    p.includes('tests.cs') ||
-    // PHP/Laravel test patterns
-    p.endsWith('test.php') ||
-    p.endsWith('spec.php') ||
-    p.includes('/tests/feature/') ||
-    p.includes('/tests/unit/')
-  );
+  return isTestFilePath(filePath);
 }
 
 /**
@@ -312,7 +196,7 @@ export function isTestFile(filePath: string): boolean {
  */
 export function isUtilityFile(filePath: string): boolean {
   const p = filePath.toLowerCase().replace(/\\/g, '/');
-  
+
   return (
     p.includes('/utils/') ||
     p.includes('/util/') ||
